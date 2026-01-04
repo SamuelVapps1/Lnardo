@@ -485,7 +485,18 @@ class App:
             s = self._get_settings()
 
             rows = read_skus(s.csv_path)
-            total_items = len(rows) * 2  # pack + piece per SKU
+            
+            # Count actual items to generate (only where refs exist)
+            total_items = 0
+            for r in rows:
+                sku = r["sku"]
+                pack_ref = find_ref_image(s.pack_dir, sku, "pack")
+                piece_ref = find_ref_image(s.piece_dir, sku, "piece")
+                if pack_ref:
+                    total_items += 1
+                if piece_ref:
+                    total_items += 1
+            
             done = 0
 
             s.output_dir.mkdir(parents=True, exist_ok=True)
@@ -505,80 +516,81 @@ class App:
 
                 pack_ref = find_ref_image(s.pack_dir, sku, "pack")
                 piece_ref = find_ref_image(s.piece_dir, sku, "piece")
-                if not pack_ref or not piece_ref:
-                    self._log(f"[SKIP] {sku} missing refs.")
+
+                if not pack_ref and not piece_ref:
+                    self._log(f"[SKIP] {sku} missing both pack + piece refs.")
                     continue
 
                 out_sku_dir = s.output_dir / sku
                 out_sku_dir.mkdir(parents=True, exist_ok=True)
 
-                # determine output paths (we use .png default; if you want strict .jpg later, we can add conversion)
-                out_pack = out_sku_dir / f"{sku}__pack.png"
-                out_piece = out_sku_dir / f"{sku}__piece.png"
-
                 # --- PACK ---
-                if not (s.skip_existing and out_pack.exists()):
-                    self.status_var.set(f"{sku}: uploading pack ref…")
-                    self._log(f"[{sku}] Upload pack ref: {pack_ref.name}")
-                    pack_init_id = client.upload_init_image(pack_ref)
+                if pack_ref:
+                    out_pack = out_sku_dir / f"{sku}__pack.png"
+                    if not (s.skip_existing and out_pack.exists()):
+                        self.status_var.set(f"{sku}: uploading pack ref…")
+                        self._log(f"[{sku}] Upload pack ref: {pack_ref.name}")
+                        pack_init_id = client.upload_init_image(pack_ref)
 
-                    self.status_var.set(f"{sku}: generating PACK…")
-                    gen_id, cost = client.create_generation(
-                        prompt=s.pack_prompt,
-                        negative_prompt=s.negative_prompt,
-                        width=s.width,
-                        height=s.height,
-                        init_image_id=pack_init_id,
-                        init_strength=s.pack_strength,
-                        alchemy=s.alchemy,
-                        num_images=1,
-                    )
-                    self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
+                        self.status_var.set(f"{sku}: generating PACK…")
+                        gen_id, cost = client.create_generation(
+                            prompt=s.pack_prompt,
+                            negative_prompt=s.negative_prompt,
+                            width=s.width,
+                            height=s.height,
+                            init_image_id=pack_init_id,
+                            init_strength=s.pack_strength,
+                            alchemy=s.alchemy,
+                            num_images=1,
+                        )
+                        self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
 
-                    urls = client.wait_for_urls(gen_id, poll_s=s.poll_s, timeout_s=s.timeout_s)
-                    url = urls[0]
-                    # keep .png path; if URL ends with .jpg we still save into .png (content is still valid image bytes)
-                    client.download(url, out_pack)
-                    append_manifest(manifest_path, [sku, name, "pack", gen_id, cost, str(out_pack)])
-                    self._log(f"[{sku}] Saved PACK -> {out_pack.name}")
-                else:
-                    self._log(f"[{sku}] PACK exists, skipping.")
-                done += 1
-                self.progress_var.set(done / total_items * 100.0)
+                        urls = client.wait_for_urls(gen_id, poll_s=s.poll_s, timeout_s=s.timeout_s)
+                        url = urls[0]
+                        # keep .png path; if URL ends with .jpg we still save into .png (content is still valid image bytes)
+                        client.download(url, out_pack)
+                        append_manifest(manifest_path, [sku, name, "pack", gen_id, cost, str(out_pack)])
+                        self._log(f"[{sku}] Saved PACK -> {out_pack.name}")
+                    else:
+                        self._log(f"[{sku}] PACK exists, skipping.")
+                    done += 1
+                    self.progress_var.set(done / total_items * 100.0)
 
-                if self.stop_event.is_set():
-                    self._log("Stopped by user (after PACK).")
-                    self.status_var.set("Stopped.")
-                    return
+                    if self.stop_event.is_set():
+                        self._log("Stopped by user (after PACK).")
+                        self.status_var.set("Stopped.")
+                        return
 
                 # --- PIECE ---
-                if not (s.skip_existing and out_piece.exists()):
-                    self.status_var.set(f"{sku}: uploading piece ref…")
-                    self._log(f"[{sku}] Upload piece ref: {piece_ref.name}")
-                    piece_init_id = client.upload_init_image(piece_ref)
+                if piece_ref:
+                    out_piece = out_sku_dir / f"{sku}__piece.png"
+                    if not (s.skip_existing and out_piece.exists()):
+                        self.status_var.set(f"{sku}: uploading piece ref…")
+                        self._log(f"[{sku}] Upload piece ref: {piece_ref.name}")
+                        piece_init_id = client.upload_init_image(piece_ref)
 
-                    self.status_var.set(f"{sku}: generating PIECE…")
-                    gen_id2, cost2 = client.create_generation(
-                        prompt=s.piece_prompt,
-                        negative_prompt=s.negative_prompt,
-                        width=s.width,
-                        height=s.height,
-                        init_image_id=piece_init_id,
-                        init_strength=s.piece_strength,
-                        alchemy=s.alchemy,
-                        num_images=1,
-                    )
-                    self._log(f"[{sku}] PIECE gen_id={gen_id2} cost={cost2}")
+                        self.status_var.set(f"{sku}: generating PIECE…")
+                        gen_id2, cost2 = client.create_generation(
+                            prompt=s.piece_prompt,
+                            negative_prompt=s.negative_prompt,
+                            width=s.width,
+                            height=s.height,
+                            init_image_id=piece_init_id,
+                            init_strength=s.piece_strength,
+                            alchemy=s.alchemy,
+                            num_images=1,
+                        )
+                        self._log(f"[{sku}] PIECE gen_id={gen_id2} cost={cost2}")
 
-                    urls2 = client.wait_for_urls(gen_id2, poll_s=s.poll_s, timeout_s=s.timeout_s)
-                    url2 = urls2[0]
-                    client.download(url2, out_piece)
-                    append_manifest(manifest_path, [sku, name, "piece", gen_id2, cost2, str(out_piece)])
-                    self._log(f"[{sku}] Saved PIECE -> {out_piece.name}")
-                else:
-                    self._log(f"[{sku}] PIECE exists, skipping.")
-                done += 1
-                self.progress_var.set(done / total_items * 100.0)
+                        urls2 = client.wait_for_urls(gen_id2, poll_s=s.poll_s, timeout_s=s.timeout_s)
+                        url2 = urls2[0]
+                        client.download(url2, out_piece)
+                        append_manifest(manifest_path, [sku, name, "piece", gen_id2, cost2, str(out_piece)])
+                        self._log(f"[{sku}] Saved PIECE -> {out_piece.name}")
+                    else:
+                        self._log(f"[{sku}] PIECE exists, skipping.")
+                    done += 1
+                    self.progress_var.set(done / total_items * 100.0)
 
             self.status_var.set("Done ✅")
             self._log("Batch complete.")
