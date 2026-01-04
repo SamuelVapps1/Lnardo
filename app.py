@@ -17,6 +17,12 @@ from tkinter import ttk, messagebox, filedialog
 # --- Leonardo REST base ---
 BASE_URL = "https://cloud.leonardo.ai/api/rest/v1"  # official base
 
+# Model ID configuration
+LEONARDO_MODEL_ID = os.getenv("LEONARDO_MODEL_ID", "").strip()
+if not LEONARDO_MODEL_ID:
+    # Lucid Realism default (bezpečný fallback)
+    LEONARDO_MODEL_ID = "05ce0082-2d80-4a2d-8653-4d1c85e2418e"
+
 ALLOWED_EXTS = [".jpg", ".jpeg", ".png", ".webp"]
 
 DEFAULT_PACK_PROMPT = (
@@ -127,6 +133,7 @@ class LeonardoClient:
         num_images: int = 1,
     ) -> Tuple[str, Optional[int]]:
         payload: Dict[str, Any] = {
+            "modelId": LEONARDO_MODEL_ID,
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "width": width,
@@ -140,6 +147,9 @@ class LeonardoClient:
         }
 
         r = self.session.post(f"{BASE_URL}/generations", headers=self.headers_json, json=payload, timeout=60)
+        if not r.ok:
+            # Toto ti povie presný dôvod 400 (chýbajúci field, zlá hodnota, atď.)
+            raise RuntimeError(f"Leonardo API error {r.status_code}: {r.text}")
         r.raise_for_status()
         data = r.json()
 
