@@ -45,8 +45,6 @@ class Settings:
     pack_dir: Path
     piece_dir: Path
     output_dir: Path
-    gen_pack: bool = True
-    gen_piece: bool = True
     width: int = 1024
     height: int = 1024
     pack_strength: float = 0.22
@@ -265,9 +263,6 @@ class App:
         self.alchemy_var = tk.BooleanVar(value=True)
         self.skip_existing_var = tk.BooleanVar(value=True)
 
-        self.gen_pack_var = tk.BooleanVar(value=True)
-        self.gen_piece_var = tk.BooleanVar(value=True)
-
         self.progress_var = tk.DoubleVar(value=0.0)
         self.status_var = tk.StringVar(value="Idle.")
 
@@ -320,8 +315,6 @@ class App:
         ttk.Entry(row1, textvariable=self.width_var, width=8).pack(side="left", padx=(6, 16))
         ttk.Label(row1, text="Height").pack(side="left")
         ttk.Entry(row1, textvariable=self.height_var, width=8).pack(side="left", padx=(6, 16))
-        ttk.Checkbutton(row1, text="Generate pack", variable=self.gen_pack_var).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(row1, text="Generate piece", variable=self.gen_piece_var).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(row1, text="Alchemy", variable=self.alchemy_var).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(row1, text="Skip existing outputs", variable=self.skip_existing_var).pack(side="left")
 
@@ -408,8 +401,6 @@ class App:
             pack_dir=Path(self.pack_dir_var.get()),
             piece_dir=Path(self.piece_dir_var.get()),
             output_dir=Path(self.output_dir_var.get()),
-            gen_pack=bool(self.gen_pack_var.get()),
-            gen_piece=bool(self.gen_piece_var.get()),
             width=int(self.width_var.get()),
             height=int(self.height_var.get()),
             pack_strength=float(self.pack_strength_var.get()),
@@ -441,11 +432,6 @@ class App:
     def on_validate(self):
         try:
             s = self._get_settings()
-
-            if not s.gen_pack and not s.gen_piece:
-                messagebox.showerror("Validation", "Select at least one: Generate pack or Generate piece.")
-                return
-
             if not s.csv_path.exists():
                 raise FileNotFoundError(f"CSV not found: {s.csv_path}")
             if not s.pack_dir.exists():
@@ -456,42 +442,21 @@ class App:
             rows = read_skus(s.csv_path)
             self._log(f"Loaded {len(rows)} SKUs from CSV.")
 
-            missing_pack = 0
-            missing_piece = 0
-            ok_any = 0
-
+            missing = 0
             for r in rows:
                 sku = r["sku"]
                 pack = find_ref_image(s.pack_dir, sku, "pack")
                 piece = find_ref_image(s.piece_dir, sku, "piece")
+                if not pack or not piece:
+                    missing += 1
+                    self._log(f"[MISSING] {sku} pack={bool(pack)} piece={bool(piece)}")
 
-                will_do_any = False
-
-                if s.gen_pack and not pack:
-                    missing_pack += 1
-                    self._log(f"[MISSING PACK] {sku}")
-                if s.gen_piece and not piece:
-                    missing_piece += 1
-                    self._log(f"[MISSING PIECE] {sku}")
-
-                if (s.gen_pack and pack) or (s.gen_piece and piece):
-                    will_do_any = True
-
-                if will_do_any:
-                    ok_any += 1
-
-            self._log(
-                f"Validation summary: "
-                f"ready={ok_any}/{len(rows)} | "
-                f"missing_pack={missing_pack if s.gen_pack else 'n/a'} | "
-                f"missing_piece={missing_piece if s.gen_piece else 'n/a'}"
-            )
-
-            if ok_any == 0:
-                self.status_var.set("Validation: nothing to generate.")
+            if missing == 0:
+                self._log("Validation OK ✅  All SKUs have pack + piece refs.")
+                self.status_var.set("Validation OK.")
             else:
-                self.status_var.set("Validation OK (partial allowed).")
-
+                self._log(f"Validation done. Missing refs for {missing} SKUs.")
+                self.status_var.set(f"Validation: {missing} missing.")
         except Exception as e:
             messagebox.showerror("Validation Failed", str(e))
             self.status_var.set("Validation failed.")
@@ -519,44 +484,26 @@ class App:
             client = LeonardoClient(api_key)
             s = self._get_settings()
 
-            if not s.gen_pack and not s.gen_piece:
-                messagebox.showerror("Start", "Select at least one: Generate pack or Generate piece.")
-                self.status_var.set("Idle.")
-                return
-
             rows = read_skus(s.csv_path)
-
-            # Prepare output + manifest
-            s.output_dir.mkdir(parents=True, exist_ok=True)
-            manifest_path = s.output_dir / "manifest.csv"
-            ensure_manifest(manifest_path)
-
-            # Pre-compute total work units (for accurate progress)
-            planned = 0
+            
+            # Count actual items to generate (only where refs exist)
+            total_items = 0
             for r in rows:
                 sku = r["sku"]
                 pack_ref = find_ref_image(s.pack_dir, sku, "pack")
                 piece_ref = find_ref_image(s.piece_dir, sku, "piece")
-
-                out_sku_dir = s.output_dir / sku
-                out_pack = out_sku_dir / f"{sku}__pack.png"
-                out_piece = out_sku_dir / f"{sku}__piece.png"
-
-                if s.gen_pack and pack_ref:
-                    if not (s.skip_existing and out_pack.exists()):
-                        planned += 1
-                if s.gen_piece and piece_ref:
-                    if not (s.skip_existing and out_piece.exists()):
-                        planned += 1
-
-            if planned == 0:
-                self._log("Nothing to generate (either missing refs or outputs already exist).")
-                self.status_var.set("Nothing to do.")
-                self.progress_var.set(0.0)
-                return
-
+                if pack_ref:
+                    total_items += 1
+                if piece_ref:
+                    total_items += 1
+            
             done = 0
-            self._log(f"Batch start: {len(rows)} SKUs -> {planned} images planned.")
+
+            s.output_dir.mkdir(parents=True, exist_ok=True)
+            manifest_path = s.output_dir / "manifest.csv"
+            ensure_manifest(manifest_path)
+
+            self._log(f"Batch start: {len(rows)} SKUs -> {total_items} images.")
 
             for r in rows:
                 if self.stop_event.is_set():
@@ -570,20 +517,16 @@ class App:
                 pack_ref = find_ref_image(s.pack_dir, sku, "pack")
                 piece_ref = find_ref_image(s.piece_dir, sku, "piece")
 
+                if not pack_ref and not piece_ref:
+                    self._log(f"[SKIP] {sku} missing both pack + piece refs.")
+                    continue
+
                 out_sku_dir = s.output_dir / sku
                 out_sku_dir.mkdir(parents=True, exist_ok=True)
 
-                out_pack = out_sku_dir / f"{sku}__pack.png"
-                out_piece = out_sku_dir / f"{sku}__piece.png"
-
-                # If neither selected ref exists, skip SKU
-                has_any = (s.gen_pack and pack_ref) or (s.gen_piece and piece_ref)
-                if not has_any:
-                    self._log(f"[SKIP] {sku} no usable refs for selected modes.")
-                    continue
-
-                # --- PACK (optional) ---
-                if s.gen_pack and pack_ref:
+                # --- PACK ---
+                if pack_ref:
+                    out_pack = out_sku_dir / f"{sku}__pack.png"
                     if not (s.skip_existing and out_pack.exists()):
                         self.status_var.set(f"{sku}: uploading pack ref…")
                         self._log(f"[{sku}] Upload pack ref: {pack_ref.name}")
@@ -603,22 +546,24 @@ class App:
                         self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
 
                         urls = client.wait_for_urls(gen_id, poll_s=s.poll_s, timeout_s=s.timeout_s)
-                        client.download(urls[0], out_pack)
+                        url = urls[0]
+                        # keep .png path; if URL ends with .jpg we still save into .png (content is still valid image bytes)
+                        client.download(url, out_pack)
                         append_manifest(manifest_path, [sku, name, "pack", gen_id, cost, str(out_pack)])
                         self._log(f"[{sku}] Saved PACK -> {out_pack.name}")
-
-                        done += 1
-                        self.progress_var.set(done / planned * 100.0)
                     else:
                         self._log(f"[{sku}] PACK exists, skipping.")
+                    done += 1
+                    self.progress_var.set(done / total_items * 100.0)
 
-                if self.stop_event.is_set():
-                    self._log("Stopped by user.")
-                    self.status_var.set("Stopped.")
-                    return
+                    if self.stop_event.is_set():
+                        self._log("Stopped by user (after PACK).")
+                        self.status_var.set("Stopped.")
+                        return
 
-                # --- PIECE (optional) ---
-                if s.gen_piece and piece_ref:
+                # --- PIECE ---
+                if piece_ref:
+                    out_piece = out_sku_dir / f"{sku}__piece.png"
                     if not (s.skip_existing and out_piece.exists()):
                         self.status_var.set(f"{sku}: uploading piece ref…")
                         self._log(f"[{sku}] Upload piece ref: {piece_ref.name}")
@@ -638,18 +583,17 @@ class App:
                         self._log(f"[{sku}] PIECE gen_id={gen_id2} cost={cost2}")
 
                         urls2 = client.wait_for_urls(gen_id2, poll_s=s.poll_s, timeout_s=s.timeout_s)
-                        client.download(urls2[0], out_piece)
+                        url2 = urls2[0]
+                        client.download(url2, out_piece)
                         append_manifest(manifest_path, [sku, name, "piece", gen_id2, cost2, str(out_piece)])
                         self._log(f"[{sku}] Saved PIECE -> {out_piece.name}")
-
-                        done += 1
-                        self.progress_var.set(done / planned * 100.0)
                     else:
                         self._log(f"[{sku}] PIECE exists, skipping.")
+                    done += 1
+                    self.progress_var.set(done / total_items * 100.0)
 
             self.status_var.set("Done ✅")
             self._log("Batch complete.")
-
         except Exception as e:
             self.status_var.set("Error.")
             self._log(f"[ERROR] {e}")
