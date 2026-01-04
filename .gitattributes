@@ -1,2 +1,50 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# --- Secrets ---
+.env
+.env.*
+*.key
+*.pem
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.ruff_cache/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+
+# --- Virtual env ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- IDEs / Editors ---
+.vscode/
+.idea/
+*.iml
+
+# Cursor (optional)
+.cursor/
+.cursor-cache/
+
+# --- Outputs / generated assets ---
+output/
+outputs/
+downloads/
+tmp/
+temp/
+*.log
+
+# --- Packaging / build (PyInstaller) ---
+build/
+dist/
+*.spec
