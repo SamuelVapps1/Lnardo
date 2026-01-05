@@ -888,8 +888,10 @@ class App:
         self._poll_log_queue()
         # Apply initial profile to sync UI
         self.apply_profile(self.profile_var.get())
-        # Apply initial profile to sync UI
-        self.apply_profile(self.profile_var.get())
+        
+        # Initialize lockable widgets list (will be populated in _build_ui)
+        self.lockable_widgets: List[Any] = []
+        self.run_log_fp = None
 
     def _build_ui(self):
         pad = 12
@@ -910,9 +912,11 @@ class App:
 
         ttk.Button(actions, text="Test API Key (GET /me)", command=self.on_test_api).pack(side="left")
         ttk.Button(actions, text="Validate Batch (files + CSV)", command=self.on_validate).pack(side="left", padx=(8, 0))
-        ttk.Button(actions, text="Start Generation", command=self.on_start).pack(side="left", padx=(8, 0))
-        ttk.Button(actions, text="Stop", command=self.on_stop).pack(side="left", padx=(8, 0))
-        ttk.Button(actions, text="Open Output Folder", command=self.on_open_output).pack(side="left", padx=(8, 0))
+        self.start_btn = ttk.Button(actions, text="Start Generation", command=self.on_start)
+        self.start_btn.pack(side="left", padx=(8, 0))
+        self.stop_btn = ttk.Button(actions, text="Stop", command=self.on_stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Open Workspace Folder", command=self.on_open_workspace).pack(side="left", padx=(8, 0))
 
         # Paths
         paths = ttk.LabelFrame(self.root, text="Paths", padding=pad)
@@ -930,51 +934,78 @@ class App:
         row1 = ttk.Frame(settings)
         row1.pack(fill="x")
         ttk.Label(row1, text="Width").pack(side="left")
-        ttk.Entry(row1, textvariable=self.width_var, width=8).pack(side="left", padx=(6, 16))
+        width_entry = ttk.Entry(row1, textvariable=self.width_var, width=8)
+        width_entry.pack(side="left", padx=(6, 16))
         ttk.Label(row1, text="Height").pack(side="left")
-        ttk.Entry(row1, textvariable=self.height_var, width=8).pack(side="left", padx=(6, 16))
-        ttk.Checkbutton(row1, text="Generate pack", variable=self.gen_pack_var).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(row1, text="Generate piece", variable=self.gen_piece_var).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(row1, text="Alchemy", variable=self.alchemy_var).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(row1, text="Skip existing outputs", variable=self.skip_existing_var).pack(side="left")
+        height_entry = ttk.Entry(row1, textvariable=self.height_var, width=8)
+        height_entry.pack(side="left", padx=(6, 16))
+        gen_pack_cb = ttk.Checkbutton(row1, text="Generate pack", variable=self.gen_pack_var)
+        gen_pack_cb.pack(side="left", padx=(0, 12))
+        gen_piece_cb = ttk.Checkbutton(row1, text="Generate piece", variable=self.gen_piece_var)
+        gen_piece_cb.pack(side="left", padx=(0, 16))
+        alchemy_cb = ttk.Checkbutton(row1, text="Alchemy", variable=self.alchemy_var)
+        alchemy_cb.pack(side="left", padx=(0, 16))
+        skip_existing_cb = ttk.Checkbutton(row1, text="Skip existing outputs", variable=self.skip_existing_var)
+        skip_existing_cb.pack(side="left")
 
         ttk.Label(row1, text="Profile").pack(side="left", padx=(16, 0))
         profile_combo = ttk.Combobox(row1, textvariable=self.profile_var, values=["CHEAP", "HQ"], width=6, state="readonly")
         profile_combo.pack(side="left", padx=(6, 16))
         profile_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_profile(self.profile_var.get()))
         ttk.Label(row1, text="Steps").pack(side="left", padx=(0, 0))
-        ttk.Entry(row1, textvariable=self.steps_var, width=6).pack(side="left", padx=(6, 16))
+        steps_entry = ttk.Entry(row1, textvariable=self.steps_var, width=6)
+        steps_entry.pack(side="left", padx=(6, 16))
 
         ttk.Checkbutton(row1, text="HQ model", variable=self.hq_var).pack(side="left", padx=(0, 12))
-        ttk.Button(row1, text="Preset: CHEAP", command=self.apply_preset_cheap).pack(side="left", padx=(0, 8))
-        ttk.Button(row1, text="Preset: HQ", command=self.apply_preset_hq).pack(side="left")
+        preset_cheap_btn = ttk.Button(row1, text="Preset: CHEAP", command=self.apply_preset_cheap)
+        preset_cheap_btn.pack(side="left", padx=(0, 8))
+        preset_hq_btn = ttk.Button(row1, text="Preset: HQ", command=self.apply_preset_hq)
+        preset_hq_btn.pack(side="left")
+        
+        # Add to lockable widgets
+        self.lockable_widgets.extend([width_entry, height_entry, gen_pack_cb, gen_piece_cb, alchemy_cb, skip_existing_cb, profile_combo, steps_entry, preset_cheap_btn, preset_hq_btn])
 
         row2 = ttk.Frame(settings)
         row2.pack(fill="x", pady=(8, 0))
         ttk.Label(row2, text="Pack init_strength").pack(side="left")
-        ttk.Entry(row2, textvariable=self.pack_strength_var, width=8).pack(side="left", padx=(6, 16))
+        pack_strength_entry = ttk.Entry(row2, textvariable=self.pack_strength_var, width=8)
+        pack_strength_entry.pack(side="left", padx=(6, 16))
         ttk.Label(row2, text="Piece init_strength").pack(side="left")
-        ttk.Entry(row2, textvariable=self.piece_strength_var, width=8).pack(side="left", padx=(6, 16))
+        piece_strength_entry = ttk.Entry(row2, textvariable=self.piece_strength_var, width=8)
+        piece_strength_entry.pack(side="left", padx=(6, 16))
         
         row3 = ttk.Frame(settings)
         row3.pack(fill="x", pady=(8, 0))
-        ttk.Checkbutton(row3, text="Reject refs with text/watermark overlays (recommended)", variable=self.reject_watermarks_var).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(row3, text="Studio Photo Mode", variable=self.studio_mode_var).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(row3, text="Normalize framing (postprocess)", variable=self.normalize_framing_var).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(row3, text="Enhance blurry refs (denoise+upscale+sharpen)", variable=self.enhance_refs_var).pack(side="left")
+        reject_watermarks_cb = ttk.Checkbutton(row3, text="Reject refs with text/watermark overlays (recommended)", variable=self.reject_watermarks_var)
+        reject_watermarks_cb.pack(side="left", padx=(0, 16))
+        studio_mode_cb = ttk.Checkbutton(row3, text="Studio Photo Mode", variable=self.studio_mode_var)
+        studio_mode_cb.pack(side="left", padx=(0, 16))
+        normalize_framing_cb = ttk.Checkbutton(row3, text="Normalize framing (postprocess)", variable=self.normalize_framing_var)
+        normalize_framing_cb.pack(side="left", padx=(0, 16))
+        enhance_refs_cb = ttk.Checkbutton(row3, text="Enhance blurry refs (denoise+upscale+sharpen)", variable=self.enhance_refs_var)
+        enhance_refs_cb.pack(side="left")
+        
+        # Add to lockable widgets
+        self.lockable_widgets.extend([pack_strength_entry, piece_strength_entry, reject_watermarks_cb, studio_mode_cb, normalize_framing_cb, enhance_refs_cb])
 
         # Prompts
         prompts = ttk.LabelFrame(self.root, text="Prompts", padding=pad)
         prompts.pack(fill="both", expand=False, padx=pad, pady=(0, pad))
 
         ttk.Label(prompts, text="Pack prompt:").pack(anchor="w")
-        ttk.Entry(prompts, textvariable=self.pack_prompt).pack(fill="x", pady=(2, 8))
+        pack_prompt_entry = ttk.Entry(prompts, textvariable=self.pack_prompt)
+        pack_prompt_entry.pack(fill="x", pady=(2, 8))
 
         ttk.Label(prompts, text="Piece prompt:").pack(anchor="w")
-        ttk.Entry(prompts, textvariable=self.piece_prompt).pack(fill="x", pady=(2, 8))
+        piece_prompt_entry = ttk.Entry(prompts, textvariable=self.piece_prompt)
+        piece_prompt_entry.pack(fill="x", pady=(2, 8))
 
         ttk.Label(prompts, text="Negative prompt:").pack(anchor="w")
-        ttk.Entry(prompts, textvariable=self.negative_prompt).pack(fill="x", pady=(2, 0))
+        negative_prompt_entry = ttk.Entry(prompts, textvariable=self.negative_prompt)
+        negative_prompt_entry.pack(fill="x", pady=(2, 0))
+        
+        # Add to lockable widgets
+        self.lockable_widgets.extend([pack_prompt_entry, piece_prompt_entry, negative_prompt_entry])
 
         # Progress + status
         prog = ttk.Frame(self.root, padding=(pad, 0, pad, pad))
@@ -994,11 +1025,23 @@ class App:
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=4)
         ttk.Label(row, text=label, width=16).pack(side="left")
-        ttk.Entry(row, textvariable=var).pack(side="left", fill="x", expand=True, padx=(6, 6))
-        ttk.Button(row, text="Browse", command=browse_cmd, width=10).pack(side="left")
+        entry = ttk.Entry(row, textvariable=var)
+        entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
+        browse_btn = ttk.Button(row, text="Browse", command=browse_cmd, width=10)
+        browse_btn.pack(side="left")
+        # Add to lockable widgets
+        self.lockable_widgets.extend([entry, browse_btn])
 
     def _log(self, msg: str):
+        """Log message to GUI queue and run log file if open."""
         self.log_q.put(msg)
+        # Also write to run log file if open
+        if self.run_log_fp:
+            try:
+                self.run_log_fp.write(msg + "\n")
+                self.run_log_fp.flush()
+            except:
+                pass
 
     def _poll_log_queue(self):
         try:
@@ -1042,43 +1085,23 @@ class App:
             messagebox.showerror("Error", f"Cannot open folder: {e}")
     
     def _lock_ui(self, locked: bool):
-        """Lock/unlock UI controls during generation."""
+        """Lock/unlock UI controls during generation using whitelist approach."""
         state = "disabled" if locked else "normal"
         
-        # Lock path entries
-        for widget in self.root.winfo_children():
-            self._lock_widget_recursive(widget, state, ["stop_btn", "start_btn"])
+        # Lock/unlock all widgets in whitelist
+        for widget in self.lockable_widgets:
+            try:
+                widget.config(state=state)
+            except:
+                pass
         
-        # Enable/disable stop button
+        # Enable/disable start/stop buttons
         if locked:
             self.stop_btn.config(state="normal")
             self.start_btn.config(state="disabled")
         else:
             self.stop_btn.config(state="disabled")
             self.start_btn.config(state="normal")
-    
-    def _lock_widget_recursive(self, widget, state: str, exclude_names: List[str]):
-        """Recursively lock/unlock widgets, excluding certain names."""
-        widget_class = widget.winfo_class()
-        widget_name = str(widget)
-        
-        # Skip stop button and other excluded widgets
-        if any(exc in widget_name for exc in exclude_names):
-            return
-        
-        # Lock Entry, Spinbox, Combobox, Checkbutton, Button (except excluded)
-        if widget_class in ("Entry", "Spinbox", "TCombobox", "TCheckbutton", "TButton"):
-            try:
-                widget.config(state=state)
-            except:
-                pass
-        
-        # Recurse into children
-        try:
-            for child in widget.winfo_children():
-                self._lock_widget_recursive(child, state, exclude_names)
-        except:
-            pass
 
     def apply_profile(self, profile: str):
         """Apply profile preset to UI (width, height, steps, alchemy, model profile, strengths)."""
@@ -1239,6 +1262,9 @@ class App:
 
     def _run_batch(self):
         try:
+            # Lock UI
+            self.root.after(0, lambda: self._lock_ui(True))
+            
             api_key = load_api_key()
             client = LeonardoClient(api_key)
             s = self._get_settings()
@@ -1252,6 +1278,12 @@ class App:
 
             # Prepare output directory
             s.output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create run-level log file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_log_path = s.output_dir / f"run_{timestamp}.log"
+            self.run_log_fp = run_log_path.open("a", encoding="utf-8")
+            self._log(f"Run log: {run_log_path}")
 
             # Pre-compute total work units (for accurate progress)
             planned = 0
@@ -1315,102 +1347,106 @@ class App:
                 if s.gen_pack:
                     if not pack_ref:
                         self._log(f"[SKIP] {sku} Missing PACK ref")
-                        continue
-                    
-                    # Watermark detection
-                    if detect_watermark_overlay(pack_ref):
-                        if s.reject_watermarks:
-                            self._log(f"[SKIP] {sku} pack ref looks like it contains text/watermark overlay. Please use a clean photo/reference.")
-                            continue
-                        else:
-                            self._log(f"[WARNING] {sku} pack ref may contain text/watermark overlay, but continuing (reject_watermarks is OFF).")
-                    
-                    if not (s.skip_existing and out_pack.exists()):
-                        # Preprocess reference image
-                        prep_dir = out_sku_dir / "_prep"
-                        prep_pack = prep_dir / f"{sku}__pack_prep.png"
-                        prep_path, sharpness_score = preprocess_ref_image(
-                            pack_ref, prep_pack, s.width, s.height, enhance=s.enhance_refs
-                        )
-                        self._log(f"[{sku}] Preprocessed pack ref: sharpness={sharpness_score:.6f}")
-                        
-                        # Auto-tune init_strength based on sharpness
-                        base_strength = s.pack_strength
-                        if sharpness_score < BLUR_THRESHOLD:
-                            effective_strength = max(0.70, min(base_strength, 0.78))
-                        else:
-                            effective_strength = base_strength
-                        effective_strength = clamp_init_strength(effective_strength)
-                        
-                        self.status_var.set(f"{sku}: uploading pack ref…")
-                        self._log(f"[{sku}] Using pack ref: {pack_ref.name} (preprocessed: {prep_path.name})")
-                        pack_init_id = client.upload_init_image(prep_path)
-                        
-                        # Build strict prompt with studio mode
-                        pack_prompt_text = build_strict_prompt("pack", s.pack_prompt, name, studio_mode=s.studio_mode)
-                        
-                        current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
-                        
-                        # Debug payload log
-                        self._log(f"[PAYLOAD] {sku} PACK | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | sharpness={sharpness_score:.6f} base_strength={base_strength:.2f} effective_strength={effective_strength:.2f} | ref={pack_ref.name}")
-
-                        self.status_var.set(f"{sku}: generating PACK…")
-                        gen_id, cost = client.create_generation(
-                            prompt=pack_prompt_text,
-                            negative_prompt=s.negative_prompt,
-                            width=s.width,
-                            height=s.height,
-                            init_image_id=pack_init_id,
-                            init_strength=effective_strength,
-                            alchemy=s.alchemy,
-                            num_images=s.pack_num_images,
-                            inference_steps=s.inference_steps,
-                            model_profile=s.model_profile,
-                            studio_mode=s.studio_mode,
-                            variant="pack",
-                        )
-                        
-                        self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
-
-                        urls = client.wait_for_urls(gen_id, poll_s=s.poll_s, timeout_s=s.timeout_s)
-                        client.download(urls[0], out_pack)
-                        
-                        # Optional postprocess for framing
-                        if s.normalize_framing:
-                            normalize_product_framing(out_pack, s.width, s.height)
-                            self._log(f"[{sku}] Applied framing normalization to PACK")
-                        
-                        # Save settings.json
-                        settings_json = {
-                            "sku": sku,
-                            "name": name,
-                            "variant": "pack",
-                            "profile": s.model_profile,
-                            "width": s.width,
-                            "height": s.height,
-                            "steps": s.inference_steps,
-                            "alchemy": s.alchemy,
-                            "init_strength": effective_strength,
-                            "modelId": MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP,
-                            "prompt": pack_prompt_text,
-                            "negative_prompt": s.negative_prompt,
-                        }
-                        settings_path = out_sku_dir / "pack_settings.json"
-                        with settings_path.open("w", encoding="utf-8") as f:
-                            json.dump(settings_json, f, indent=2)
-                        
-                        append_manifest(manifest_path, [
-                            sku, name, "pack", gen_id, cost, str(out_pack),
-                            s.model_profile, s.width, s.height, s.inference_steps,
-                            s.alchemy, s.pack_strength,
-                            MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
-                        ])
-                        self._log(f"[{sku}] Saved PACK -> {out_pack.name}")
-
-                        done += 1
-                        self.progress_var.set(done / planned * 100.0)
-                    else:
+                        append_manifest(manifest_path, [sku, name, "pack", "", "", "", "SKIPPED", "Missing reference image"])
+                    elif detect_watermark_overlay(pack_ref) and s.reject_watermarks:
+                        self._log(f"[SKIP] {sku} pack ref looks like it contains text/watermark overlay. Please use a clean photo/reference.")
+                        append_manifest(manifest_path, [sku, name, "pack", "", "", "", "SKIPPED", "Watermark/text overlay detected"])
+                    elif s.skip_existing and out_pack.exists():
                         self._log(f"[{sku}] PACK exists, skipping.")
+                        append_manifest(manifest_path, [sku, name, "pack", "", "", "", "SKIPPED", "Output already exists"])
+                    else:
+                        # Watermark warning but continue
+                        if detect_watermark_overlay(pack_ref):
+                            self._log(f"[WARNING] {sku} pack ref may contain text/watermark overlay, but continuing (reject_watermarks is OFF).")
+                        
+                        try:
+                            # Preprocess reference image
+                            prep_dir = out_sku_dir / "_prep"
+                            prep_pack = prep_dir / f"{sku}__pack_prep.png"
+                            prep_path, sharpness_score = preprocess_ref_image(
+                                pack_ref, prep_pack, s.width, s.height, enhance=s.enhance_refs
+                            )
+                            self._log(f"[{sku}] Preprocessed pack ref: sharpness={sharpness_score:.6f}")
+                            
+                            # Auto-tune init_strength based on sharpness
+                            base_strength = s.pack_strength
+                            if sharpness_score < BLUR_THRESHOLD:
+                                effective_strength = max(0.70, min(base_strength, 0.78))
+                            else:
+                                effective_strength = base_strength
+                            effective_strength = clamp_init_strength(effective_strength)
+                            
+                            self.status_var.set(f"{sku}: uploading pack ref…")
+                            self._log(f"[{sku}] Using pack ref: {pack_ref.name} (preprocessed: {prep_path.name})")
+                            pack_init_id = client.upload_init_image(prep_path)
+                            
+                            # Build strict prompt with studio mode
+                            pack_prompt_text = build_strict_prompt("pack", s.pack_prompt, name, studio_mode=s.studio_mode)
+                            
+                            current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
+                            
+                            # Debug payload log
+                            self._log(f"[PAYLOAD] {sku} PACK | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | sharpness={sharpness_score:.6f} base_strength={base_strength:.2f} effective_strength={effective_strength:.2f} | ref={pack_ref.name}")
+
+                            self.status_var.set(f"{sku}: generating PACK…")
+                            gen_id, cost = client.create_generation(
+                                prompt=pack_prompt_text,
+                                negative_prompt=s.negative_prompt,
+                                width=s.width,
+                                height=s.height,
+                                init_image_id=pack_init_id,
+                                init_strength=effective_strength,
+                                alchemy=s.alchemy,
+                                num_images=s.pack_num_images,
+                                inference_steps=s.inference_steps,
+                                model_profile=s.model_profile,
+                                studio_mode=s.studio_mode,
+                                variant="pack",
+                            )
+                            
+                            self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
+
+                            urls = client.wait_for_urls(gen_id, poll_s=s.poll_s, timeout_s=s.timeout_s)
+                            client.download(urls[0], out_pack)
+                            
+                            # Optional postprocess for framing
+                            if s.normalize_framing:
+                                normalize_product_framing(out_pack, s.width, s.height)
+                                self._log(f"[{sku}] Applied framing normalization to PACK")
+                            
+                            # Save settings.json
+                            settings_json = {
+                                "sku": sku,
+                                "name": name,
+                                "variant": "pack",
+                                "profile": s.model_profile,
+                                "width": s.width,
+                                "height": s.height,
+                                "steps": s.inference_steps,
+                                "alchemy": s.alchemy,
+                                "init_strength": effective_strength,
+                                "modelId": MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP,
+                                "prompt": pack_prompt_text,
+                                "negative_prompt": s.negative_prompt,
+                            }
+                            settings_path = out_sku_dir / "pack_settings.json"
+                            with settings_path.open("w", encoding="utf-8") as f:
+                                json.dump(settings_json, f, indent=2)
+                            
+                            append_manifest(manifest_path, [
+                                sku, name, "pack", gen_id, cost, str(out_pack), "OK", ""
+                            ])
+                            self._log(f"[{sku}] Saved PACK -> {out_pack.name}")
+
+                            done += 1
+                            self.progress_var.set(done / planned * 100.0)
+                        except Exception as e:
+                            error_msg = str(e)
+                            self._log(f"[ERROR] {sku} PACK generation failed: {error_msg}")
+                            append_manifest(manifest_path, [
+                                sku, name, "pack", "", "", "", "FAILED", error_msg
+                            ])
+                            # Continue to piece generation, don't abort SKU
 
                 if self.stop_event.is_set():
                     self._log("Stopped by user.")
@@ -1421,102 +1457,106 @@ class App:
                 if s.gen_piece:
                     if not piece_ref:
                         self._log(f"[SKIP] {sku} Missing PIECE ref")
-                        continue
-                    
-                    # Watermark detection
-                    if detect_watermark_overlay(piece_ref):
-                        if s.reject_watermarks:
-                            self._log(f"[SKIP] {sku} piece ref looks like it contains text/watermark overlay. Please use a clean photo/reference.")
-                            continue
-                        else:
-                            self._log(f"[WARNING] {sku} piece ref may contain text/watermark overlay, but continuing (reject_watermarks is OFF).")
-                    
-                    if not (s.skip_existing and out_piece.exists()):
-                        # Preprocess reference image
-                        prep_dir = out_sku_dir / "_prep"
-                        prep_piece = prep_dir / f"{sku}__piece_prep.png"
-                        prep_path, sharpness_score = preprocess_ref_image(
-                            piece_ref, prep_piece, s.width, s.height, enhance=s.enhance_refs
-                        )
-                        self._log(f"[{sku}] Preprocessed piece ref: sharpness={sharpness_score:.6f}")
-                        
-                        # Auto-tune init_strength based on sharpness
-                        base_strength = s.piece_strength
-                        if sharpness_score < BLUR_THRESHOLD:
-                            effective_strength = max(0.70, min(base_strength, 0.78))
-                        else:
-                            effective_strength = base_strength
-                        effective_strength = clamp_init_strength(effective_strength)
-                        
-                        self.status_var.set(f"{sku}: uploading piece ref…")
-                        self._log(f"[{sku}] Using piece ref: {piece_ref.name} (preprocessed: {prep_path.name})")
-                        piece_init_id = client.upload_init_image(prep_path)
-                        
-                        # Build strict prompt with studio mode
-                        piece_prompt_text = build_strict_prompt("piece", s.piece_prompt, name, studio_mode=s.studio_mode)
-                        
-                        current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
-                        
-                        # Debug payload log
-                        self._log(f"[PAYLOAD] {sku} PIECE | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | sharpness={sharpness_score:.6f} base_strength={base_strength:.2f} effective_strength={effective_strength:.2f} | ref={piece_ref.name}")
-
-                        self.status_var.set(f"{sku}: generating PIECE…")
-                        gen_id2, cost2 = client.create_generation(
-                            prompt=piece_prompt_text,
-                            negative_prompt=s.negative_prompt,
-                            width=s.width,
-                            height=s.height,
-                            init_image_id=piece_init_id,
-                            init_strength=effective_strength,
-                            alchemy=s.alchemy,
-                            num_images=s.piece_num_images,
-                            inference_steps=s.inference_steps,
-                            model_profile=s.model_profile,
-                            studio_mode=s.studio_mode,
-                            variant="piece",
-                        )
-                        
-                        self._log(f"[{sku}] PIECE gen_id={gen_id2} cost={cost2}")
-
-                        urls2 = client.wait_for_urls(gen_id2, poll_s=s.poll_s, timeout_s=s.timeout_s)
-                        client.download(urls2[0], out_piece)
-                        
-                        # Optional postprocess for framing
-                        if s.normalize_framing:
-                            normalize_product_framing(out_piece, s.width, s.height)
-                            self._log(f"[{sku}] Applied framing normalization to PIECE")
-                        
-                        # Save settings.json
-                        settings_json = {
-                            "sku": sku,
-                            "name": name,
-                            "variant": "piece",
-                            "profile": s.model_profile,
-                            "width": s.width,
-                            "height": s.height,
-                            "steps": s.inference_steps,
-                            "alchemy": s.alchemy,
-                            "init_strength": effective_strength,
-                            "modelId": MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP,
-                            "prompt": piece_prompt_text,
-                            "negative_prompt": s.negative_prompt,
-                        }
-                        settings_path = out_sku_dir / "piece_settings.json"
-                        with settings_path.open("w", encoding="utf-8") as f:
-                            json.dump(settings_json, f, indent=2)
-                        
-                        append_manifest(manifest_path, [
-                            sku, name, "piece", gen_id2, cost2, str(out_piece),
-                            s.model_profile, s.width, s.height, s.inference_steps,
-                            s.alchemy, effective_strength,
-                            MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
-                        ])
-                        self._log(f"[{sku}] Saved PIECE -> {out_piece.name}")
-
-                        done += 1
-                        self.progress_var.set(done / planned * 100.0)
-                    else:
+                        append_manifest(manifest_path, [sku, name, "piece", "", "", "", "SKIPPED", "Missing reference image"])
+                    elif detect_watermark_overlay(piece_ref) and s.reject_watermarks:
+                        self._log(f"[SKIP] {sku} piece ref looks like it contains text/watermark overlay. Please use a clean photo/reference.")
+                        append_manifest(manifest_path, [sku, name, "piece", "", "", "", "SKIPPED", "Watermark/text overlay detected"])
+                    elif s.skip_existing and out_piece.exists():
                         self._log(f"[{sku}] PIECE exists, skipping.")
+                        append_manifest(manifest_path, [sku, name, "piece", "", "", "", "SKIPPED", "Output already exists"])
+                    else:
+                        # Watermark warning but continue
+                        if detect_watermark_overlay(piece_ref):
+                            self._log(f"[WARNING] {sku} piece ref may contain text/watermark overlay, but continuing (reject_watermarks is OFF).")
+                        
+                        try:
+                            # Preprocess reference image
+                            prep_dir = out_sku_dir / "_prep"
+                            prep_piece = prep_dir / f"{sku}__piece_prep.png"
+                            prep_path, sharpness_score = preprocess_ref_image(
+                                piece_ref, prep_piece, s.width, s.height, enhance=s.enhance_refs
+                            )
+                            self._log(f"[{sku}] Preprocessed piece ref: sharpness={sharpness_score:.6f}")
+                            
+                            # Auto-tune init_strength based on sharpness
+                            base_strength = s.piece_strength
+                            if sharpness_score < BLUR_THRESHOLD:
+                                effective_strength = max(0.70, min(base_strength, 0.78))
+                            else:
+                                effective_strength = base_strength
+                            effective_strength = clamp_init_strength(effective_strength)
+                            
+                            self.status_var.set(f"{sku}: uploading piece ref…")
+                            self._log(f"[{sku}] Using piece ref: {piece_ref.name} (preprocessed: {prep_path.name})")
+                            piece_init_id = client.upload_init_image(prep_path)
+                            
+                            # Build strict prompt with studio mode
+                            piece_prompt_text = build_strict_prompt("piece", s.piece_prompt, name, studio_mode=s.studio_mode)
+                            
+                            current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
+                            
+                            # Debug payload log
+                            self._log(f"[PAYLOAD] {sku} PIECE | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | sharpness={sharpness_score:.6f} base_strength={base_strength:.2f} effective_strength={effective_strength:.2f} | ref={piece_ref.name}")
+
+                            self.status_var.set(f"{sku}: generating PIECE…")
+                            gen_id2, cost2 = client.create_generation(
+                                prompt=piece_prompt_text,
+                                negative_prompt=s.negative_prompt,
+                                width=s.width,
+                                height=s.height,
+                                init_image_id=piece_init_id,
+                                init_strength=effective_strength,
+                                alchemy=s.alchemy,
+                                num_images=s.piece_num_images,
+                                inference_steps=s.inference_steps,
+                                model_profile=s.model_profile,
+                                studio_mode=s.studio_mode,
+                                variant="piece",
+                            )
+                            
+                            self._log(f"[{sku}] PIECE gen_id={gen_id2} cost={cost2}")
+
+                            urls2 = client.wait_for_urls(gen_id2, poll_s=s.poll_s, timeout_s=s.timeout_s)
+                            client.download(urls2[0], out_piece)
+                            
+                            # Optional postprocess for framing
+                            if s.normalize_framing:
+                                normalize_product_framing(out_piece, s.width, s.height)
+                                self._log(f"[{sku}] Applied framing normalization to PIECE")
+                            
+                            # Save settings.json
+                            settings_json = {
+                                "sku": sku,
+                                "name": name,
+                                "variant": "piece",
+                                "profile": s.model_profile,
+                                "width": s.width,
+                                "height": s.height,
+                                "steps": s.inference_steps,
+                                "alchemy": s.alchemy,
+                                "init_strength": effective_strength,
+                                "modelId": MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP,
+                                "prompt": piece_prompt_text,
+                                "negative_prompt": s.negative_prompt,
+                            }
+                            settings_path = out_sku_dir / "piece_settings.json"
+                            with settings_path.open("w", encoding="utf-8") as f:
+                                json.dump(settings_json, f, indent=2)
+                            
+                            append_manifest(manifest_path, [
+                                sku, name, "piece", gen_id2, cost2, str(out_piece), "OK", ""
+                            ])
+                            self._log(f"[{sku}] Saved PIECE -> {out_piece.name}")
+
+                            done += 1
+                            self.progress_var.set(done / planned * 100.0)
+                        except Exception as e:
+                            error_msg = str(e)
+                            self._log(f"[ERROR] {sku} PIECE generation failed: {error_msg}")
+                            append_manifest(manifest_path, [
+                                sku, name, "piece", "", "", "", "FAILED", error_msg
+                            ])
+                            # Continue to next SKU
 
             self.status_var.set("Done ✅")
             self._log("Batch complete.")
@@ -1525,6 +1565,16 @@ class App:
             self.status_var.set("Error.")
             self._log(f"[ERROR] {e}")
             messagebox.showerror("Generation Error", str(e))
+        finally:
+            # Close run log file
+            if self.run_log_fp:
+                try:
+                    self.run_log_fp.close()
+                except:
+                    pass
+                self.run_log_fp = None
+            # Unlock UI
+            self.root.after(0, lambda: self._lock_ui(False))
 
 def main():
     root = tk.Tk()
