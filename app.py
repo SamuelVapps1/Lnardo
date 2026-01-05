@@ -180,7 +180,6 @@ class LeonardoClient:
                 )
             payload["init_image_id"] = init_image_id
             payload["init_strength"] = float(init_strength)
-            payload["isInitImage"] = True
 
         r = self.session.post(f"{BASE_URL}/generations", headers=self.headers_json, json=payload, timeout=60)
         if not r.ok:
