@@ -17,11 +17,26 @@ from tkinter import ttk, messagebox, filedialog
 # --- Leonardo REST base ---
 BASE_URL = "https://cloud.leonardo.ai/api/rest/v1"  # official base
 
-# Model ID configuration
-LEONARDO_MODEL_ID = os.getenv("LEONARDO_MODEL_ID", "").strip()
-if not LEONARDO_MODEL_ID:
-    # Lucid Realism default (bezpečný fallback)
-    LEONARDO_MODEL_ID = "05ce0082-2d80-4a2d-8653-4d1c85e2418e"
+# Load .env early from the same folder as this script (works regardless of CWD)
+ENV_PATH = Path(__file__).with_name(".env")
+load_dotenv(dotenv_path=ENV_PATH, override=False)
+
+def get_model_id() -> str:
+    """
+    Read modelId from env dynamically (prevents 'env loaded too late' issues).
+    Default uses an SDXL-capable model suitable for init_image_id workflows.
+    """
+    mid = (os.getenv("LEONARDO_MODEL_ID") or "").strip()
+    return mid or "5c232a9e-9061-4777-980a-ddc8e65647c6"  # Leonardo Vision XL
+
+def get_i2i_fallback_model_id() -> str:
+    mid = (os.getenv("LEONARDO_I2I_FALLBACK_MODEL_ID") or "").strip()
+    return mid or get_model_id()
+
+I2I_UNSUPPORTED_MODEL_IDS = {
+    "05ce0082-2d80-4a2d-8653-4d1c85e2418e": "Lucid Realism",
+    "7b592283-e8a7-4c5a-9ba6-d18c31f258b9": "Lucid Origin",
+}
 
 ALLOWED_EXTS = [".jpg", ".jpeg", ".png", ".webp"]
 
@@ -132,23 +147,42 @@ class LeonardoClient:
         alchemy: bool,
         num_images: int = 1,
     ) -> Tuple[str, Optional[int]]:
+        model_id = get_model_id()
         payload: Dict[str, Any] = {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
-            "modelId": LEONARDO_MODEL_ID,
+            "modelId": model_id,
             "width": int(width),
             "height": int(height),
-            "num_images": 1,
+            "num_images": int(num_images),
             "alchemy": bool(alchemy),
         }
 
         # iba ak ideš image-to-image (máš init image)
         if init_image_id:
+            if model_id in I2I_UNSUPPORTED_MODEL_IDS:
+                mname = I2I_UNSUPPORTED_MODEL_IDS[model_id]
+                raise ValueError(
+                    f"Model '{mname}' (modelId={model_id}) nepodporuje image-to-image cez init_image_id. "
+                    f"Nastav LEONARDO_MODEL_ID na SDXL model, napr. Leonardo Vision XL "
+                    f"(5c232a9e-9061-4777-980a-ddc8e65647c6) alebo Leonardo Diffusion XL "
+                    f"(1e60896f-3c26-4296-8ecc-53e2afecc132)."
+                )
             payload["init_image_id"] = init_image_id
             payload["init_strength"] = float(init_strength)
 
         r = self.session.post(f"{BASE_URL}/generations", headers=self.headers_json, json=payload, timeout=60)
         if not r.ok:
+            txt = r.text or ""
+            # Actionable message for your exact failure
+            if r.status_code == 400 and "Image to image defaults do not exist for model" in txt:
+                raise RuntimeError(
+                    "Leonardo API 400: Vybraný model nepodporuje image-to-image cez init_image_id.\n"
+                    f"Aktuálne modelId: {model_id}\n"
+                    "Fix: nastav v .env LEONARDO_MODEL_ID na SDXL model (napr. Leonardo Vision XL) "
+                    "a reštartuj appku.\n"
+                    f"Raw: {txt}"
+                )
             # Toto ti povie presný dôvod 400 (chýbajúci field, zlá hodnota, atď.)
             raise RuntimeError(f"Leonardo API error {r.status_code}: {r.text}")
         r.raise_for_status()
@@ -198,7 +232,8 @@ class LeonardoClient:
                         f.write(chunk)
 
 def load_api_key() -> str:
-    load_dotenv()
+    # already loaded at import time, but keep as safety no-op
+    load_dotenv(dotenv_path=ENV_PATH, override=False)
     api_key = os.getenv("LEONARDO_API_KEY")
     if not api_key:
         raise RuntimeError("Missing LEONARDO_API_KEY. Create .env from .env.example and paste your key.")
@@ -437,6 +472,7 @@ class App:
             api_key = load_api_key()
             client = LeonardoClient(api_key)
             me = client.get_me()
+            self._log(f"Using modelId: {get_model_id()}")
             user = me.get("user") or {}
             username = user.get("username") or user.get("email") or "unknown"
             self._log(f"API OK ✅  Logged in as: {username}")
@@ -529,6 +565,7 @@ class App:
             api_key = load_api_key()
             client = LeonardoClient(api_key)
             s = self._get_settings()
+            self._log(f"Using modelId: {get_model_id()}")
 
             if not s.gen_pack and not s.gen_piece:
                 messagebox.showerror("Start", "Select at least one: Generate pack or Generate piece.")
