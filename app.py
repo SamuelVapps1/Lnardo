@@ -17,7 +17,7 @@ from PIL import Image, ImageFilter, ImageEnhance
 import numpy as np
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 
 # --- Leonardo REST base ---
 BASE_URL = "https://cloud.leonardo.ai/api/rest/v1"  # official base
@@ -849,15 +849,16 @@ class App:
         self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
 
+        # --- INIT THESE BEFORE _build_ui ---
+        self.lockable_widgets: List[Any] = []
+        self.run_log_fp = None
+
         # Workspace paths (default to workspace directory)
         self.workspace_dir = WORKSPACE_DIR
         self.csv_var = tk.StringVar(value=str(self.workspace_dir / "skus.csv"))
         self.pack_dir_var = tk.StringVar(value=str(self.workspace_dir / "input" / "pack"))
         self.piece_dir_var = tk.StringVar(value=str(self.workspace_dir / "input" / "piece"))
         self.output_dir_var = tk.StringVar(value=str(self.workspace_dir / "output"))
-        
-        # UI control references for locking
-        self.ui_controls: List[Any] = []
 
         self.width_var = tk.IntVar(value=1024)
         self.height_var = tk.IntVar(value=1024)
@@ -888,10 +889,6 @@ class App:
         self._poll_log_queue()
         # Apply initial profile to sync UI
         self.apply_profile(self.profile_var.get())
-        
-        # Initialize lockable widgets list (will be populated in _build_ui)
-        self.lockable_widgets: List[Any] = []
-        self.run_log_fp = None
 
     def _build_ui(self):
         pad = 12
@@ -1042,6 +1039,50 @@ class App:
                 self.run_log_fp.flush()
             except:
                 pass
+    
+    def ui(self, fn):
+        """Thread-safe UI update helper."""
+        self.root.after(0, fn)
+    
+    def set_status(self, text: str):
+        """Thread-safe status update."""
+        self.ui(lambda: self.status_var.set(text))
+    
+    def set_progress(self, val: float):
+        """Thread-safe progress update."""
+        self.ui(lambda: self.progress_var.set(val))
+    
+    def ensure_api_key_ui(self) -> Optional[str]:
+        """
+        Ensure API key exists. If missing, prompt user (UI thread) and save to workspace .env.
+        Returns api_key or None if user cancelled.
+        """
+        try:
+            return load_api_key(workspace_dir=self.workspace_dir)
+        except RuntimeError as e:
+            if str(e) != "API_KEY_MISSING":
+                messagebox.showerror("API Key Error", str(e))
+                return None
+
+        # Ask user
+        key = simpledialog.askstring(
+            "Leonardo API Key",
+            "Paste your Leonardo API key:",
+            parent=self.root,
+            show="*"
+        )
+        if not key:
+            return None
+
+        key = key.strip()
+        save_api_key_to_env(key, workspace_dir=self.workspace_dir)  # saves to Documents\LnardoTool\.env
+        try:
+            # Reload env
+            load_dotenv(dotenv_path=self.workspace_dir / ".env", override=True)
+            return load_api_key(workspace_dir=self.workspace_dir)
+        except Exception as e:
+            messagebox.showerror("API Key Error", f"Could not validate saved key: {e}")
+            return None
 
     def _poll_log_queue(self):
         try:
@@ -1162,8 +1203,11 @@ class App:
         )
 
     def on_test_api(self):
+        api_key = self.ensure_api_key_ui()
+        if not api_key:
+            return
+        
         try:
-            api_key = load_api_key()
             client = LeonardoClient(api_key)
             me = client.get_me()
             self._log(f"Using modelId: {get_model_id()}")
@@ -1248,6 +1292,12 @@ class App:
             messagebox.showinfo("Busy", "Generation is already running.")
             return
 
+        api_key = self.ensure_api_key_ui()
+        if not api_key:
+            self.status_var.set("Idle.")
+            self._log("API key missing/cancelled.")
+            return
+
         self.stop_event.clear()
         self.progress_var.set(0.0)
         self.status_var.set("Starting...")
@@ -1265,13 +1315,14 @@ class App:
             # Lock UI
             self.root.after(0, lambda: self._lock_ui(True))
             
-            api_key = load_api_key()
+            # API key already validated in on_start(), but reload to be safe
+            api_key = load_api_key(workspace_dir=self.workspace_dir)
             client = LeonardoClient(api_key)
             s = self._get_settings()
 
             if not s.gen_pack and not s.gen_piece:
-                messagebox.showerror("Start", "Select at least one: Generate pack or Generate piece.")
-                self.status_var.set("Idle.")
+                self.ui(lambda: messagebox.showerror("Start", "Select at least one: Generate pack or Generate piece."))
+                self.set_status("Idle.")
                 return
 
             rows = read_skus(s.csv_path)
@@ -1307,8 +1358,8 @@ class App:
 
             if planned == 0:
                 self._log("Nothing to generate (either missing refs or outputs already exist).")
-                self.status_var.set("Nothing to do.")
-                self.progress_var.set(0.0)
+                self.set_status("Nothing to do.")
+                self.set_progress(0.0)
                 return
 
             done = 0
@@ -1319,7 +1370,7 @@ class App:
             for r in rows:
                 if self.stop_event.is_set():
                     self._log("Stopped by user.")
-                    self.status_var.set("Stopped.")
+                    self.set_status("Stopped.")
                     return
 
                 sku = r["sku"]
@@ -1376,7 +1427,7 @@ class App:
                                 effective_strength = base_strength
                             effective_strength = clamp_init_strength(effective_strength)
                             
-                            self.status_var.set(f"{sku}: uploading pack ref…")
+                            self.set_status(f"{sku}: uploading pack ref…")
                             self._log(f"[{sku}] Using pack ref: {pack_ref.name} (preprocessed: {prep_path.name})")
                             pack_init_id = client.upload_init_image(prep_path)
                             
@@ -1388,7 +1439,7 @@ class App:
                             # Debug payload log
                             self._log(f"[PAYLOAD] {sku} PACK | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | sharpness={sharpness_score:.6f} base_strength={base_strength:.2f} effective_strength={effective_strength:.2f} | ref={pack_ref.name}")
 
-                            self.status_var.set(f"{sku}: generating PACK…")
+                            self.set_status(f"{sku}: generating PACK…")
                             gen_id, cost = client.create_generation(
                                 prompt=pack_prompt_text,
                                 negative_prompt=s.negative_prompt,
@@ -1450,7 +1501,7 @@ class App:
 
                 if self.stop_event.is_set():
                     self._log("Stopped by user.")
-                    self.status_var.set("Stopped.")
+                    self.set_status("Stopped.")
                     return
 
                 # --- PIECE (optional) ---
@@ -1486,7 +1537,7 @@ class App:
                                 effective_strength = base_strength
                             effective_strength = clamp_init_strength(effective_strength)
                             
-                            self.status_var.set(f"{sku}: uploading piece ref…")
+                            self.set_status(f"{sku}: uploading piece ref…")
                             self._log(f"[{sku}] Using piece ref: {piece_ref.name} (preprocessed: {prep_path.name})")
                             piece_init_id = client.upload_init_image(prep_path)
                             
@@ -1498,7 +1549,7 @@ class App:
                             # Debug payload log
                             self._log(f"[PAYLOAD] {sku} PIECE | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | sharpness={sharpness_score:.6f} base_strength={base_strength:.2f} effective_strength={effective_strength:.2f} | ref={piece_ref.name}")
 
-                            self.status_var.set(f"{sku}: generating PIECE…")
+                            self.set_status(f"{sku}: generating PIECE…")
                             gen_id2, cost2 = client.create_generation(
                                 prompt=piece_prompt_text,
                                 negative_prompt=s.negative_prompt,
@@ -1549,7 +1600,7 @@ class App:
                             self._log(f"[{sku}] Saved PIECE -> {out_piece.name}")
 
                             done += 1
-                            self.progress_var.set(done / planned * 100.0)
+                            self.set_progress(done / planned * 100.0)
                         except Exception as e:
                             error_msg = str(e)
                             self._log(f"[ERROR] {sku} PIECE generation failed: {error_msg}")
@@ -1558,13 +1609,13 @@ class App:
                             ])
                             # Continue to next SKU
 
-            self.status_var.set("Done ✅")
+            self.set_status("Done ✅")
             self._log("Batch complete.")
 
         except Exception as e:
-            self.status_var.set("Error.")
+            self.set_status("Error.")
             self._log(f"[ERROR] {e}")
-            messagebox.showerror("Generation Error", str(e))
+            self.ui(lambda: messagebox.showerror("Generation Error", str(e)))
         finally:
             # Close run log file
             if self.run_log_fp:
