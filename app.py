@@ -84,6 +84,8 @@ class Settings:
     skip_existing: bool = True
     inference_steps: int = 12
     model_profile: str = "CHEAP"  # CHEAP | HQ
+    pack_num_images: int = 2
+    piece_num_images: int = 1
     # note: resolution controlled by width/height
     poll_s: float = 2.0
     timeout_s: int = 240
@@ -340,6 +342,10 @@ class App:
 
         self._build_ui()
         self._poll_log_queue()
+        # Apply initial profile to sync UI
+        self.apply_profile(self.profile_var.get())
+        # Apply initial profile to sync UI
+        self.apply_profile(self.profile_var.get())
 
     def _build_ui(self):
         pad = 12
@@ -389,7 +395,9 @@ class App:
         ttk.Checkbutton(row1, text="Skip existing outputs", variable=self.skip_existing_var).pack(side="left")
 
         ttk.Label(row1, text="Profile").pack(side="left", padx=(16, 0))
-        ttk.Combobox(row1, textvariable=self.profile_var, values=["CHEAP", "HQ"], width=6, state="readonly").pack(side="left", padx=(6, 16))
+        profile_combo = ttk.Combobox(row1, textvariable=self.profile_var, values=["CHEAP", "HQ"], width=6, state="readonly")
+        profile_combo.pack(side="left", padx=(6, 16))
+        profile_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_profile(self.profile_var.get()))
         ttk.Label(row1, text="Steps").pack(side="left", padx=(0, 0))
         ttk.Entry(row1, textvariable=self.steps_var, width=6).pack(side="left", padx=(6, 16))
 
@@ -474,28 +482,33 @@ class App:
         except Exception as e:
             messagebox.showerror("Error", f"Cannot open folder: {e}")
 
+    def apply_profile(self, profile: str):
+        """Apply profile preset to UI (width, height, steps, alchemy, model profile)."""
+        if profile == "CHEAP":
+            self.width_var.set(768)
+            self.height_var.set(768)
+            self.steps_var.set(10)
+            self.alchemy_var.set(False)
+            if hasattr(self, 'hq_var'):
+                self.hq_var.set(False)
+            self.profile_var.set("CHEAP")
+            # keep init strengths unchanged
+        elif profile == "HQ":
+            self.width_var.set(1024)
+            self.height_var.set(1024)
+            self.steps_var.set(15)
+            self.alchemy_var.set(True)
+            if hasattr(self, 'hq_var'):
+                self.hq_var.set(True)
+            self.profile_var.set("HQ")
+            # keep init strengths unchanged
+
     def apply_preset_cheap(self):
-        # sweet spot for ecommerce gallery
-        self.width_var.set(768)
-        self.height_var.set(768)
-        self.steps_var.set(12)
-        self.alchemy_var.set(False)
-        self.hq_var.set(False)
-        self.profile_var.set("CHEAP")
-        # keep init strengths conservative for fidelity
-        self.pack_strength_var.set(0.22)
-        self.piece_strength_var.set(0.35)
-        self._log("Applied preset CHEAP: Lightning XL, 768, steps=12, alchemy=OFF")
+        self.apply_profile("CHEAP")
+        self._log("Applied preset CHEAP: Lightning XL, 768, steps=10, alchemy=OFF")
 
     def apply_preset_hq(self):
-        self.width_var.set(1024)
-        self.height_var.set(1024)
-        self.steps_var.set(15)
-        self.alchemy_var.set(True)
-        self.hq_var.set(True)
-        self.profile_var.set("HQ")
-        self.pack_strength_var.set(0.22)
-        self.piece_strength_var.set(0.35)
+        self.apply_profile("HQ")
         self._log("Applied preset HQ: Vision XL, 1024, steps=15, alchemy=ON")
 
     def _get_settings(self) -> Settings:
@@ -514,6 +527,8 @@ class App:
             skip_existing=bool(self.skip_existing_var.get()),
             inference_steps=int(self.steps_var.get()),
             model_profile=self.profile_var.get(),
+            pack_num_images=2,
+            piece_num_images=1,
             pack_prompt=self.pack_prompt.get().strip(),
             piece_prompt=self.piece_prompt.get().strip(),
             negative_prompt=self.negative_prompt.get().strip(),
@@ -617,7 +632,6 @@ class App:
             api_key = load_api_key()
             client = LeonardoClient(api_key)
             s = self._get_settings()
-            self._log(f"Using modelId: {get_model_id()}")
 
             if not s.gen_pack and not s.gen_piece:
                 messagebox.showerror("Start", "Select at least one: Generate pack or Generate piece.")
@@ -639,11 +653,13 @@ class App:
                 piece_ref = find_ref_image(s.piece_dir, sku, "piece")
 
                 out_sku_dir = s.output_dir / sku
-                out_pack = out_sku_dir / f"{sku}__pack.png"
+                out_pack1 = out_sku_dir / f"{sku}__pack.png"
+                out_pack2 = out_sku_dir / f"{sku}__pack_02.png"
                 out_piece = out_sku_dir / f"{sku}__piece.png"
 
                 if s.gen_pack and pack_ref:
-                    if not (s.skip_existing and out_pack.exists()):
+                    pack_both_exist = s.skip_existing and out_pack1.exists() and out_pack2.exists()
+                    if not pack_both_exist:
                         planned += 1
                 if s.gen_piece and piece_ref:
                     if not (s.skip_existing and out_piece.exists()):
@@ -675,7 +691,8 @@ class App:
                 out_sku_dir = s.output_dir / sku
                 out_sku_dir.mkdir(parents=True, exist_ok=True)
 
-                out_pack = out_sku_dir / f"{sku}__pack.png"
+                out_pack1 = out_sku_dir / f"{sku}__pack.png"
+                out_pack2 = out_sku_dir / f"{sku}__pack_02.png"
                 out_piece = out_sku_dir / f"{sku}__piece.png"
 
                 # If neither selected ref exists, skip SKU
@@ -684,15 +701,20 @@ class App:
                     self._log(f"[SKIP] {sku} no usable refs for selected modes.")
                     continue
 
+                # Log before generating each SKU
+                current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
+                self._log(f"Profile={s.model_profile} modelId={current_model} | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy}")
+
                 # --- PACK (optional) ---
                 if s.gen_pack and pack_ref:
-                    if not (s.skip_existing and out_pack.exists()):
+                    # Check if both pack files exist for skip logic
+                    pack_both_exist = s.skip_existing and out_pack1.exists() and out_pack2.exists()
+                    if not pack_both_exist:
                         self.status_var.set(f"{sku}: uploading pack ref…")
                         self._log(f"[{sku}] Upload pack ref: {pack_ref.name}")
                         pack_init_id = client.upload_init_image(pack_ref)
 
                         self.status_var.set(f"{sku}: generating PACK…")
-                        self._log(f"Profile={s.model_profile} modelId={(MODEL_HQ if s.model_profile == 'HQ' else MODEL_CHEAP)}")
                         gen_id, cost = client.create_generation(
                             prompt=s.pack_prompt,
                             negative_prompt=s.negative_prompt,
@@ -701,21 +723,44 @@ class App:
                             init_image_id=pack_init_id,
                             init_strength=s.pack_strength,
                             alchemy=s.alchemy,
-                            num_images=1,
+                            num_images=s.pack_num_images,
                             inference_steps=s.inference_steps,
                             model_profile=s.model_profile,
                         )
                         self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
 
                         urls = client.wait_for_urls(gen_id, poll_s=s.poll_s, timeout_s=s.timeout_s)
-                        client.download(urls[0], out_pack)
-                        append_manifest(manifest_path, [sku, name, "pack", gen_id, cost, str(out_pack)])
-                        self._log(f"[{sku}] Saved PACK -> {out_pack.name}")
+                        
+                        # Save multiple pack images
+                        saved_files = []
+                        for idx, url in enumerate(urls):
+                            if idx == 0:
+                                out_file = out_pack1
+                                variant = "pack"
+                            elif idx == 1:
+                                out_file = out_pack2
+                                variant = "pack_02"
+                            else:
+                                # Handle more than 2 images if needed
+                                out_file = out_sku_dir / f"{sku}__pack_{idx+1:02d}.png"
+                                variant = f"pack_{idx+1:02d}"
+                            
+                            if s.skip_existing and out_file.exists():
+                                self._log(f"[{sku}] {out_file.name} exists, skipping.")
+                            else:
+                                client.download(url, out_file)
+                                append_manifest(manifest_path, [sku, name, variant, gen_id, cost, str(out_file)])
+                                saved_files.append(out_file.name)
+                        
+                        if saved_files:
+                            self._log(f"[{sku}] Saved PACK -> {', '.join(saved_files)}")
+                        else:
+                            self._log(f"[{sku}] PACK all files exist, skipped.")
 
                         done += 1
                         self.progress_var.set(done / planned * 100.0)
                     else:
-                        self._log(f"[{sku}] PACK exists, skipping.")
+                        self._log(f"[{sku}] PACK exists (both files), skipping.")
 
                 if self.stop_event.is_set():
                     self._log("Stopped by user.")
@@ -730,7 +775,6 @@ class App:
                         piece_init_id = client.upload_init_image(piece_ref)
 
                         self.status_var.set(f"{sku}: generating PIECE…")
-                        self._log(f"Profile={s.model_profile} modelId={(MODEL_HQ if s.model_profile == 'HQ' else MODEL_CHEAP)}")
                         gen_id2, cost2 = client.create_generation(
                             prompt=s.piece_prompt,
                             negative_prompt=s.negative_prompt,
@@ -739,7 +783,7 @@ class App:
                             init_image_id=piece_init_id,
                             init_strength=s.piece_strength,
                             alchemy=s.alchemy,
-                            num_images=1,
+                            num_images=s.piece_num_images,
                             inference_steps=s.inference_steps,
                             model_profile=s.model_profile,
                         )
