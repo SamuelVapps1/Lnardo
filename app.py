@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import re
+import statistics
 import threading
 import time
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 import requests
 from dotenv import load_dotenv
+from PIL import Image, ImageFilter
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -66,7 +68,9 @@ DEFAULT_PIECE_PROMPT = (
 
 DEFAULT_NEGATIVE = (
     "cartoon, illustration, anime, 3d render, cgi, low quality, blurry, "
-    "extra text, watermark, logo overlay, fake label, distorted packaging"
+    "extra text, watermark, logo overlay, fake label, distorted packaging, "
+    "cheese, dairy, yogurt, dessert, jam, sauce, fruit, garnish, plate, bowl, "
+    "napkin, table setting, food styling, props, background objects"
 )
 
 @dataclass
@@ -267,7 +271,8 @@ def load_api_key() -> str:
 def safe_folder_name(sku: str, name: str, max_len: int = 120) -> str:
     """
     Create a safe folder name from SKU and name for Windows filesystem.
-    Returns {sku}_{cleaned_name} or just {sku} if name is empty.
+    Returns {sku}_{sanitized_name} or just {sku} if name is empty.
+    Sanitized name: lowercase, spaces -> '-', remove invalid chars, limit length.
     Always keeps full SKU, truncates name if needed.
     """
     if not name or not name.strip():
@@ -279,8 +284,18 @@ def safe_folder_name(sku: str, name: str, max_len: int = 120) -> str:
     for char in invalid_chars:
         cleaned = cleaned.replace(char, "-")
     
-    # Collapse multiple spaces to single space
+    # Collapse multiple spaces to single space, then replace with dashes
     cleaned = re.sub(r'\s+', ' ', cleaned)
+    cleaned = cleaned.replace(' ', '-')
+    
+    # Lowercase
+    cleaned = cleaned.lower()
+    
+    # Remove multiple consecutive dashes
+    cleaned = re.sub(r'-+', '-', cleaned)
+    
+    # Remove leading/trailing dashes
+    cleaned = cleaned.strip('-')
     
     # Build folder name
     folder_name = f"{sku}_{cleaned}"
@@ -342,6 +357,58 @@ def find_ref_images(directory: Path, sku: str, suffix: str) -> List[Path]:
     
     return results
 
+def select_primary_ref_image(paths: List[Path]) -> Path:
+    """
+    Select the best primary reference image from a list.
+    Prefers exact base filename if present, otherwise uses scoring (resolution + sharpness).
+    """
+    if not paths:
+        raise ValueError("Empty paths list")
+    
+    if len(paths) == 1:
+        return paths[0]
+    
+    # Check if first path is exact base filename (without _* suffix)
+    first_path = paths[0]
+    first_name = first_path.name.lower()
+    # Check if it matches pattern {sku}_{suffix}.{ext} (no underscore after suffix)
+    if '_' not in first_name.split('.')[0].split('_')[-1] or first_name.count('_') == 1:
+        # Likely exact match, prefer it
+        return first_path
+    
+    # Score all images
+    scored: List[Tuple[Path, float]] = []
+    
+    for path in paths:
+        try:
+            with Image.open(path) as img:
+                # Resolution score (w * h)
+                resolution_score = img.width * img.height
+                
+                # Sharpness score (edge energy via FIND_EDGES filter)
+                gray = img.convert('L')
+                edges = gray.filter(ImageFilter.FIND_EDGES)
+                # Mean pixel value as edge energy proxy
+                pixels = list(edges.getdata())
+                sharpness_score = statistics.mean(pixels) if pixels else 0
+                
+                # Combined score (normalize resolution to 0-1 range, then combine)
+                # Assuming max reasonable resolution is 4K (3840*2160 = 8294400)
+                norm_res = min(resolution_score / 8294400.0, 1.0)
+                # Sharpness is already 0-255 range, normalize to 0-1
+                norm_sharp = sharpness_score / 255.0
+                
+                # Weighted combination (favor resolution slightly)
+                combined_score = (norm_res * 0.6) + (norm_sharp * 0.4)
+                scored.append((path, combined_score))
+        except Exception as e:
+            # If image can't be opened, give it low score
+            scored.append((path, 0.0))
+    
+    # Sort by score descending, return best
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[0][0]
+
 def detect_extension_from_url(url: str) -> str:
     # heuristic; we download as .png by default
     lower = url.lower()
@@ -355,7 +422,10 @@ def ensure_manifest(manifest_path: Path) -> None:
     if not manifest_path.exists():
         with manifest_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["sku", "name", "variant", "generation_id", "api_credit_cost", "file_path"])
+            w.writerow([
+                "sku", "name", "variant", "generation_id", "api_credit_cost", "file_path",
+                "profile", "width", "height", "steps", "alchemy", "init_strength", "modelId"
+            ])
 
 def append_manifest(manifest_path: Path, row: List[Any]) -> None:
     with manifest_path.open("a", newline="", encoding="utf-8") as f:
@@ -797,22 +867,18 @@ class App:
                 # --- PACK (optional) ---
                 if s.gen_pack and pack_refs:
                     if not (s.skip_existing and out_pack.exists()):
-                        # Upload all pack refs
-                        self.status_var.set(f"{sku}: uploading pack refs…")
-                        pack_ref_ids = []
-                        for ref_file in pack_refs:
-                            self._log(f"[{sku}] Upload pack ref: {ref_file.name}")
-                            ref_id = client.upload_init_image(ref_file)
-                            pack_ref_ids.append(ref_id)
+                        # Select primary ref image
+                        primary_pack_ref = select_primary_ref_image(pack_refs)
+                        self.status_var.set(f"{sku}: uploading pack ref…")
+                        self._log(f"[{sku}] Selected primary pack ref: {primary_pack_ref.name}")
+                        pack_init_id = client.upload_init_image(primary_pack_ref)
                         
-                        # Use first as init_image_id, rest as imagePrompts
-                        pack_init_id = pack_ref_ids[0]
-                        image_prompt_ids = pack_ref_ids[1:] if len(pack_ref_ids) > 1 else None
+                        # Build prompt with product context
+                        pack_prompt_text = f"{name}. {s.pack_prompt}" if name else s.pack_prompt
 
                         self.status_var.set(f"{sku}: generating PACK…")
-                        # Try with imagePrompts first
                         gen_id, cost = client.create_generation(
-                            prompt=s.pack_prompt,
+                            prompt=pack_prompt_text,
                             negative_prompt=s.negative_prompt,
                             width=s.width,
                             height=s.height,
@@ -822,31 +888,39 @@ class App:
                             num_images=s.pack_num_images,
                             inference_steps=s.inference_steps,
                             model_profile=s.model_profile,
-                            image_prompt_ids=image_prompt_ids,
+                            image_prompt_ids=None,
                         )
-                        
-                        # If imagePrompts caused 400, retry without it
-                        if gen_id is None:
-                            self._log(f"[{sku}] PACK imagePrompts failed, retrying without imagePrompts...")
-                            gen_id, cost = client.create_generation(
-                                prompt=s.pack_prompt,
-                                negative_prompt=s.negative_prompt,
-                                width=s.width,
-                                height=s.height,
-                                init_image_id=pack_init_id,
-                                init_strength=s.pack_strength,
-                                alchemy=s.alchemy,
-                                num_images=s.pack_num_images,
-                                inference_steps=s.inference_steps,
-                                model_profile=s.model_profile,
-                                image_prompt_ids=None,
-                            )
                         
                         self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
 
                         urls = client.wait_for_urls(gen_id, poll_s=s.poll_s, timeout_s=s.timeout_s)
                         client.download(urls[0], out_pack)
-                        append_manifest(manifest_path, [sku, name, "pack", gen_id, cost, str(out_pack)])
+                        
+                        # Save settings.json
+                        settings_json = {
+                            "sku": sku,
+                            "name": name,
+                            "variant": "pack",
+                            "profile": s.model_profile,
+                            "width": s.width,
+                            "height": s.height,
+                            "steps": s.inference_steps,
+                            "alchemy": s.alchemy,
+                            "init_strength": s.pack_strength,
+                            "modelId": MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP,
+                            "prompt": pack_prompt_text,
+                            "negative_prompt": s.negative_prompt,
+                        }
+                        settings_path = out_sku_dir / "pack_settings.json"
+                        with settings_path.open("w", encoding="utf-8") as f:
+                            json.dump(settings_json, f, indent=2)
+                        
+                        append_manifest(manifest_path, [
+                            sku, name, "pack", gen_id, cost, str(out_pack),
+                            s.model_profile, s.width, s.height, s.inference_steps,
+                            s.alchemy, s.pack_strength,
+                            MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
+                        ])
                         self._log(f"[{sku}] Saved PACK -> {out_pack.name}")
 
                         done += 1
@@ -862,22 +936,18 @@ class App:
                 # --- PIECE (optional) ---
                 if s.gen_piece and piece_refs:
                     if not (s.skip_existing and out_piece.exists()):
-                        # Upload all piece refs
-                        self.status_var.set(f"{sku}: uploading piece refs…")
-                        piece_ref_ids = []
-                        for ref_file in piece_refs:
-                            self._log(f"[{sku}] Upload piece ref: {ref_file.name}")
-                            ref_id = client.upload_init_image(ref_file)
-                            piece_ref_ids.append(ref_id)
+                        # Select primary ref image
+                        primary_piece_ref = select_primary_ref_image(piece_refs)
+                        self.status_var.set(f"{sku}: uploading piece ref…")
+                        self._log(f"[{sku}] Selected primary piece ref: {primary_piece_ref.name}")
+                        piece_init_id = client.upload_init_image(primary_piece_ref)
                         
-                        # Use first as init_image_id, rest as imagePrompts
-                        piece_init_id = piece_ref_ids[0]
-                        image_prompt_ids = piece_ref_ids[1:] if len(piece_ref_ids) > 1 else None
+                        # Build prompt with product context
+                        piece_prompt_text = f"{name}. High-end macro ecommerce photo of a single piece of this dog treat. {s.piece_prompt}" if name else s.piece_prompt
 
                         self.status_var.set(f"{sku}: generating PIECE…")
-                        # Try with imagePrompts first
                         gen_id2, cost2 = client.create_generation(
-                            prompt=s.piece_prompt,
+                            prompt=piece_prompt_text,
                             negative_prompt=s.negative_prompt,
                             width=s.width,
                             height=s.height,
@@ -887,31 +957,39 @@ class App:
                             num_images=s.piece_num_images,
                             inference_steps=s.inference_steps,
                             model_profile=s.model_profile,
-                            image_prompt_ids=image_prompt_ids,
+                            image_prompt_ids=None,
                         )
-                        
-                        # If imagePrompts caused 400, retry without it
-                        if gen_id2 is None:
-                            self._log(f"[{sku}] PIECE imagePrompts failed, retrying without imagePrompts...")
-                            gen_id2, cost2 = client.create_generation(
-                                prompt=s.piece_prompt,
-                                negative_prompt=s.negative_prompt,
-                                width=s.width,
-                                height=s.height,
-                                init_image_id=piece_init_id,
-                                init_strength=s.piece_strength,
-                                alchemy=s.alchemy,
-                                num_images=s.piece_num_images,
-                                inference_steps=s.inference_steps,
-                                model_profile=s.model_profile,
-                                image_prompt_ids=None,
-                            )
                         
                         self._log(f"[{sku}] PIECE gen_id={gen_id2} cost={cost2}")
 
                         urls2 = client.wait_for_urls(gen_id2, poll_s=s.poll_s, timeout_s=s.timeout_s)
                         client.download(urls2[0], out_piece)
-                        append_manifest(manifest_path, [sku, name, "piece", gen_id2, cost2, str(out_piece)])
+                        
+                        # Save settings.json
+                        settings_json = {
+                            "sku": sku,
+                            "name": name,
+                            "variant": "piece",
+                            "profile": s.model_profile,
+                            "width": s.width,
+                            "height": s.height,
+                            "steps": s.inference_steps,
+                            "alchemy": s.alchemy,
+                            "init_strength": s.piece_strength,
+                            "modelId": MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP,
+                            "prompt": piece_prompt_text,
+                            "negative_prompt": s.negative_prompt,
+                        }
+                        settings_path = out_sku_dir / "piece_settings.json"
+                        with settings_path.open("w", encoding="utf-8") as f:
+                            json.dump(settings_json, f, indent=2)
+                        
+                        append_manifest(manifest_path, [
+                            sku, name, "piece", gen_id2, cost2, str(out_piece),
+                            s.model_profile, s.width, s.height, s.inference_steps,
+                            s.alchemy, s.piece_strength,
+                            MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
+                        ])
                         self._log(f"[{sku}] Saved PIECE -> {out_piece.name}")
 
                         done += 1
