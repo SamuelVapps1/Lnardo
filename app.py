@@ -73,6 +73,14 @@ DEFAULT_NEGATIVE = (
     "napkin, table setting, food styling, props, background objects"
 )
 
+MANDATORY_NEGATIVE_TOKENS = (
+    "placeholder, mockup, template, generic, stock photo, "
+    "cheese, dairy, yogurt, dessert, jam, sauce, fruit, garnish, "
+    "plate, bowl, napkin, table, cutting board, spoon, fork, "
+    "cartoon, illustration, anime, 3d render, cgi, low quality, blurry, "
+    "watermark, logo overlay, extra text, fake label, distorted packaging"
+)
+
 @dataclass
 class Settings:
     csv_path: Path
@@ -83,8 +91,8 @@ class Settings:
     gen_piece: bool = True
     width: int = 1024
     height: int = 1024
-    pack_strength: float = 0.22
-    piece_strength: float = 0.35
+    pack_strength: float = 0.90
+    piece_strength: float = 0.90
     alchemy: bool = True
     skip_existing: bool = True
     inference_steps: int = 12
@@ -166,36 +174,45 @@ class LeonardoClient:
         num_images: int = 1,
         inference_steps: int = 12,
         model_profile: str = "CHEAP",
-        image_prompt_ids: Optional[List[str]] = None,
-    ) -> Optional[Tuple[str, Optional[int]]]:
+    ) -> Tuple[str, Optional[int]]:
+        """
+        Create generation with strict requirements:
+        - init_image_id is REQUIRED (no text-to-image fallback)
+        - Only uses init_image_id + init_strength (no imagePrompts/content reference)
+        """
+        if not init_image_id:
+            raise ValueError("init_image_id is REQUIRED. Cannot generate without reference image.")
+        
+        # Clamp init_strength to safe range
+        clamped_strength = clamp_init_strength(float(init_strength))
+        
         model_id = MODEL_HQ if model_profile == "HQ" else MODEL_CHEAP
+        
+        # Build strict negative prompt
+        strict_negative = build_strict_negative(negative_prompt)
+        
         payload: Dict[str, Any] = {
             "prompt": prompt,
-            "negative_prompt": negative_prompt,
+            "negative_prompt": strict_negative,
             "modelId": model_id,
             "width": int(width),
             "height": int(height),
             "num_images": int(num_images),
             "alchemy": bool(alchemy),
             "num_inference_steps": int(inference_steps),
+            "init_image_id": init_image_id,
+            "init_strength": clamped_strength,
         }
 
-        # iba ak ideš image-to-image (máš init image)
-        if init_image_id:
-            if model_id in I2I_UNSUPPORTED_MODEL_IDS:
-                mname = I2I_UNSUPPORTED_MODEL_IDS[model_id]
-                raise ValueError(
-                    f"Model '{mname}' (modelId={model_id}) nepodporuje image-to-image cez init_image_id. "
-                    f"Nastav LEONARDO_MODEL_ID na SDXL model, napr. Leonardo Vision XL "
-                    f"(5c232a9e-9061-4777-980a-ddc8e65647c6) alebo Leonardo Diffusion XL "
-                    f"(1e60896f-3c26-4296-8ecc-53e2afecc132)."
-                )
-            payload["init_image_id"] = init_image_id
-            payload["init_strength"] = float(init_strength)
-
-        # Add imagePrompts if provided (for multi-reference guidance)
-        if image_prompt_ids and len(image_prompt_ids) >= 1:
-            payload["imagePrompts"] = image_prompt_ids
+        # Check model compatibility
+        if model_id in I2I_UNSUPPORTED_MODEL_IDS:
+            mname = I2I_UNSUPPORTED_MODEL_IDS[model_id]
+            raise ValueError(
+                f"Model '{mname}' (modelId={model_id}) nepodporuje image-to-image cez init_image_id. "
+                f"Nastav LEONARDO_MODEL_ID na SDXL model, napr. Leonardo Vision XL "
+                f"(5c232a9e-9061-4777-980a-ddc8e65647c6) alebo Leonardo Diffusion XL "
+                f"(1e60896f-3c26-4296-8ecc-53e2afecc132)."
+            )
 
         r = self.session.post(f"{BASE_URL}/generations", headers=self.headers_json, json=payload, timeout=60)
         if not r.ok:
@@ -209,9 +226,6 @@ class LeonardoClient:
                     "a reštartuj appku.\n"
                     f"Raw: {txt}"
                 )
-            # If imagePrompts causes 400, return None to signal retry without it
-            if r.status_code == 400 and image_prompt_ids and ("imagePrompts" in txt.lower() or "image prompt" in txt.lower()):
-                return None
             # Toto ti povie presný dôvod 400 (chýbajúci field, zlá hodnota, atď.)
             raise RuntimeError(f"Leonardo API error {r.status_code}: {r.text}")
         r.raise_for_status()
@@ -409,6 +423,52 @@ def select_primary_ref_image(paths: List[Path]) -> Path:
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[0][0]
 
+def build_strict_prompt(kind: str, base_prompt: str, name: str) -> str:
+    """
+    Build a strict anti-placeholder prompt that forces real photography look.
+    kind: "pack" or "piece"
+    base_prompt: original prompt from settings
+    name: product name from CSV (may be empty)
+    """
+    constraints = [
+        "real product photo",
+        "shot on a DSLR / studio product photography",
+        "pure white seamless background",
+        "realistic natural shadow",
+        "no plate, no bowl, no garnish, no props",
+        "do not change the product shape, material, texture or color from the reference image",
+        "match the reference image exactly"
+    ]
+    
+    constraint_text = ", ".join(constraints)
+    
+    if name:
+        prompt = f"{name}. {constraint_text}. {base_prompt}"
+    else:
+        prompt = f"{constraint_text}. {base_prompt}"
+    
+    return prompt
+
+def build_strict_negative(user_negative: str) -> str:
+    """
+    Build negative prompt with mandatory anti-placeholder tokens.
+    Always appends mandatory tokens even if user clears the field.
+    """
+    user_tokens = user_negative.strip() if user_negative else ""
+    
+    if user_tokens:
+        # Combine user tokens with mandatory tokens
+        combined = f"{user_tokens}, {MANDATORY_NEGATIVE_TOKENS}"
+    else:
+        # Use only mandatory tokens if user field is empty
+        combined = MANDATORY_NEGATIVE_TOKENS
+    
+    return combined
+
+def clamp_init_strength(value: float, min_val: float = 0.50, max_val: float = 0.98) -> float:
+    """Clamp init_strength to safe range [0.50, 0.98]."""
+    return max(min_val, min(max_val, value))
+
 def detect_extension_from_url(url: str) -> str:
     # heuristic; we download as .png by default
     lower = url.lower()
@@ -471,8 +531,8 @@ class App:
 
         self.width_var = tk.IntVar(value=1024)
         self.height_var = tk.IntVar(value=1024)
-        self.pack_strength_var = tk.DoubleVar(value=0.22)
-        self.piece_strength_var = tk.DoubleVar(value=0.35)
+        self.pack_strength_var = tk.DoubleVar(value=0.90)
+        self.piece_strength_var = tk.DoubleVar(value=0.90)
         self.alchemy_var = tk.BooleanVar(value=True)
         self.skip_existing_var = tk.BooleanVar(value=True)
         self.steps_var = tk.IntVar(value=12)
@@ -854,18 +914,16 @@ class App:
                 out_pack = out_sku_dir / f"{sku}__pack.png"
                 out_piece = out_sku_dir / f"{sku}__piece.png"
 
-                # If neither selected ref exists, skip SKU
-                has_any = (s.gen_pack and pack_refs) or (s.gen_piece and piece_refs)
-                if not has_any:
-                    self._log(f"[SKIP] {sku} no usable refs for selected modes.")
-                    continue
-
                 # Log before generating each SKU
                 current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
                 self._log(f"Profile={s.model_profile} modelId={current_model} | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy}")
 
                 # --- PACK (optional) ---
-                if s.gen_pack and pack_refs:
+                if s.gen_pack:
+                    if not pack_refs:
+                        self._log(f"[SKIP] {sku} Missing PACK refs")
+                        continue
+                    
                     if not (s.skip_existing and out_pack.exists()):
                         # Select primary ref image
                         primary_pack_ref = select_primary_ref_image(pack_refs)
@@ -873,8 +931,15 @@ class App:
                         self._log(f"[{sku}] Selected primary pack ref: {primary_pack_ref.name}")
                         pack_init_id = client.upload_init_image(primary_pack_ref)
                         
-                        # Build prompt with product context
-                        pack_prompt_text = f"{name}. {s.pack_prompt}" if name else s.pack_prompt
+                        # Build strict prompt
+                        pack_prompt_text = build_strict_prompt("pack", s.pack_prompt, name)
+                        
+                        # Clamp init_strength
+                        effective_strength = clamp_init_strength(s.pack_strength)
+                        current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
+                        
+                        # Debug payload log
+                        self._log(f"[PAYLOAD] {sku} PACK | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | init_strength={effective_strength:.2f} | ref={primary_pack_ref.name}")
 
                         self.status_var.set(f"{sku}: generating PACK…")
                         gen_id, cost = client.create_generation(
@@ -883,12 +948,11 @@ class App:
                             width=s.width,
                             height=s.height,
                             init_image_id=pack_init_id,
-                            init_strength=s.pack_strength,
+                            init_strength=effective_strength,
                             alchemy=s.alchemy,
                             num_images=s.pack_num_images,
                             inference_steps=s.inference_steps,
                             model_profile=s.model_profile,
-                            image_prompt_ids=None,
                         )
                         
                         self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
@@ -906,7 +970,7 @@ class App:
                             "height": s.height,
                             "steps": s.inference_steps,
                             "alchemy": s.alchemy,
-                            "init_strength": s.pack_strength,
+                            "init_strength": effective_strength,
                             "modelId": MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP,
                             "prompt": pack_prompt_text,
                             "negative_prompt": s.negative_prompt,
@@ -934,7 +998,11 @@ class App:
                     return
 
                 # --- PIECE (optional) ---
-                if s.gen_piece and piece_refs:
+                if s.gen_piece:
+                    if not piece_refs:
+                        self._log(f"[SKIP] {sku} Missing PIECE refs")
+                        continue
+                    
                     if not (s.skip_existing and out_piece.exists()):
                         # Select primary ref image
                         primary_piece_ref = select_primary_ref_image(piece_refs)
@@ -942,8 +1010,15 @@ class App:
                         self._log(f"[{sku}] Selected primary piece ref: {primary_piece_ref.name}")
                         piece_init_id = client.upload_init_image(primary_piece_ref)
                         
-                        # Build prompt with product context
-                        piece_prompt_text = f"{name}. High-end macro ecommerce photo of a single piece of this dog treat. {s.piece_prompt}" if name else s.piece_prompt
+                        # Build strict prompt
+                        piece_prompt_text = build_strict_prompt("piece", s.piece_prompt, name)
+                        
+                        # Clamp init_strength
+                        effective_strength = clamp_init_strength(s.piece_strength)
+                        current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
+                        
+                        # Debug payload log
+                        self._log(f"[PAYLOAD] {sku} PIECE | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | init_strength={effective_strength:.2f} | ref={primary_piece_ref.name}")
 
                         self.status_var.set(f"{sku}: generating PIECE…")
                         gen_id2, cost2 = client.create_generation(
@@ -952,12 +1027,11 @@ class App:
                             width=s.width,
                             height=s.height,
                             init_image_id=piece_init_id,
-                            init_strength=s.piece_strength,
+                            init_strength=effective_strength,
                             alchemy=s.alchemy,
                             num_images=s.piece_num_images,
                             inference_steps=s.inference_steps,
                             model_profile=s.model_profile,
-                            image_prompt_ids=None,
                         )
                         
                         self._log(f"[{sku}] PIECE gen_id={gen_id2} cost={cost2}")
@@ -975,7 +1049,7 @@ class App:
                             "height": s.height,
                             "steps": s.inference_steps,
                             "alchemy": s.alchemy,
-                            "init_strength": s.piece_strength,
+                            "init_strength": effective_strength,
                             "modelId": MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP,
                             "prompt": piece_prompt_text,
                             "negative_prompt": s.negative_prompt,
@@ -987,7 +1061,7 @@ class App:
                         append_manifest(manifest_path, [
                             sku, name, "piece", gen_id2, cost2, str(out_piece),
                             s.model_profile, s.width, s.height, s.inference_steps,
-                            s.alchemy, s.piece_strength,
+                            s.alchemy, effective_strength,
                             MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
                         ])
                         self._log(f"[{sku}] Saved PIECE -> {out_piece.name}")
