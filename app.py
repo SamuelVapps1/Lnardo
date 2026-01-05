@@ -105,6 +105,9 @@ class Settings:
     pack_prompt: str = DEFAULT_PACK_PROMPT
     piece_prompt: str = DEFAULT_PIECE_PROMPT
     negative_prompt: str = DEFAULT_NEGATIVE
+    reject_watermarks: bool = True  # Reject refs with text/watermark overlays
+    studio_mode: bool = True  # Studio Photo Mode
+    normalize_framing: bool = False  # Optional postprocess for consistent framing
 
 class LeonardoClient:
     def __init__(self, api_key: str):
@@ -174,6 +177,7 @@ class LeonardoClient:
         num_images: int = 1,
         inference_steps: int = 12,
         model_profile: str = "CHEAP",
+        studio_mode: bool = True,
     ) -> Tuple[str, Optional[int]]:
         """
         Create generation with strict requirements:
@@ -189,7 +193,7 @@ class LeonardoClient:
         model_id = MODEL_HQ if model_profile == "HQ" else MODEL_CHEAP
         
         # Build strict negative prompt
-        strict_negative = build_strict_negative(negative_prompt)
+        strict_negative = build_strict_negative(negative_prompt, studio_mode=studio_mode)
         
         payload: Dict[str, Any] = {
             "prompt": prompt,
@@ -334,139 +338,119 @@ def find_ref_image(directory: Path, sku: str, suffix: str) -> Optional[Path]:
             return p
     return None
 
-def find_ref_images(directory: Path, sku: str, suffix: str) -> List[Path]:
+def detect_watermark_overlay(image_path: Path, edge_threshold: float = 15.0, non_white_threshold: float = 0.15) -> bool:
     """
-    Find all reference images for a SKU+suffix.
-    Returns list where exact "{sku}_{suffix}.{ext}" is first if it exists,
-    then includes "{sku}_{suffix}_*.{ext}" sorted by name.
+    Detect if image contains text/watermark overlays using lightweight heuristics.
+    Checks bottom-right region and bottom-center band for edge density and non-white pixels.
+    
+    Returns True if watermark/text overlay is detected.
     """
-    results: List[Path] = []
-    
-    # First, find the primary ref (exact match)
-    primary = find_ref_image(directory, sku, suffix)
-    if primary:
-        results.append(primary)
-    
-    # Then find all additional refs matching pattern {sku}_{suffix}_*.{ext}
-    if directory.exists():
-        pattern_base = f"{sku}_{suffix}_"
-        additional: List[Path] = []
-        
-        for file_path in directory.iterdir():
-            if not file_path.is_file():
-                continue
+    try:
+        with Image.open(image_path) as img:
+            # Convert to grayscale
+            gray = img.convert('L')
+            width, height = gray.size
             
-            name = file_path.name
-            name_lower = name.lower()
+            # Region 1: Bottom-right (last 30% width × last 25% height)
+            br_x0 = int(width * 0.70)
+            br_y0 = int(height * 0.75)
+            br_region = gray.crop((br_x0, br_y0, width, height))
             
-            # Check if it matches pattern and has allowed extension
-            if name.startswith(pattern_base) and any(name_lower.endswith(ext) for ext in ALLOWED_EXTS):
-                # Make sure it's not the primary (shouldn't happen, but be safe)
-                if file_path != primary:
-                    additional.append(file_path)
-        
-        # Sort additional refs by name
-        additional.sort(key=lambda p: p.name)
-        results.extend(additional)
-    
-    return results
+            # Region 2: Bottom-center band (last 18% height × middle 60% width)
+            bc_x0 = int(width * 0.20)
+            bc_x1 = int(width * 0.80)
+            bc_y0 = int(height * 0.82)
+            bc_region = gray.crop((bc_x0, bc_y0, bc_x1, height))
+            
+            # Check both regions
+            for region in [br_region, bc_region]:
+                if region.size[0] == 0 or region.size[1] == 0:
+                    continue
+                
+                # Compute edge density using FIND_EDGES
+                edges = region.filter(ImageFilter.FIND_EDGES)
+                edge_pixels = list(edges.getdata())
+                edge_mean = statistics.mean(edge_pixels) if edge_pixels else 0
+                
+                # Compute non-white pixel ratio (threshold: >240 is near-white)
+                region_pixels = list(region.getdata())
+                non_white_count = sum(1 for p in region_pixels if p < 240)
+                non_white_ratio = non_white_count / len(region_pixels) if region_pixels else 0
+                
+                # Flag if edge density OR non-white ratio exceeds threshold
+                if edge_mean > edge_threshold or non_white_ratio > non_white_threshold:
+                    return True
+            
+            return False
+    except Exception as e:
+        # If we can't analyze, assume no watermark (don't block generation)
+        return False
 
-def select_primary_ref_image(paths: List[Path]) -> Path:
-    """
-    Select the best primary reference image from a list.
-    Prefers exact base filename if present, otherwise uses scoring (resolution + sharpness).
-    """
-    if not paths:
-        raise ValueError("Empty paths list")
-    
-    if len(paths) == 1:
-        return paths[0]
-    
-    # Check if first path is exact base filename (without _* suffix)
-    first_path = paths[0]
-    first_name = first_path.name.lower()
-    # Check if it matches pattern {sku}_{suffix}.{ext} (no underscore after suffix)
-    if '_' not in first_name.split('.')[0].split('_')[-1] or first_name.count('_') == 1:
-        # Likely exact match, prefer it
-        return first_path
-    
-    # Score all images
-    scored: List[Tuple[Path, float]] = []
-    
-    for path in paths:
-        try:
-            with Image.open(path) as img:
-                # Resolution score (w * h)
-                resolution_score = img.width * img.height
-                
-                # Sharpness score (edge energy via FIND_EDGES filter)
-                gray = img.convert('L')
-                edges = gray.filter(ImageFilter.FIND_EDGES)
-                # Mean pixel value as edge energy proxy
-                pixels = list(edges.getdata())
-                sharpness_score = statistics.mean(pixels) if pixels else 0
-                
-                # Combined score (normalize resolution to 0-1 range, then combine)
-                # Assuming max reasonable resolution is 4K (3840*2160 = 8294400)
-                norm_res = min(resolution_score / 8294400.0, 1.0)
-                # Sharpness is already 0-255 range, normalize to 0-1
-                norm_sharp = sharpness_score / 255.0
-                
-                # Weighted combination (favor resolution slightly)
-                combined_score = (norm_res * 0.6) + (norm_sharp * 0.4)
-                scored.append((path, combined_score))
-        except Exception as e:
-            # If image can't be opened, give it low score
-            scored.append((path, 0.0))
-    
-    # Sort by score descending, return best
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return scored[0][0]
-
-def build_strict_prompt(kind: str, base_prompt: str, name: str) -> str:
+def build_strict_prompt(kind: str, base_prompt: str, name: str, studio_mode: bool = True) -> str:
     """
     Build a strict anti-placeholder prompt that forces real photography look.
     kind: "pack" or "piece"
     base_prompt: original prompt from settings
     name: product name from CSV (may be empty)
+    studio_mode: if True, wrap with strict studio photo constraints
     """
-    constraints = [
-        "real product photo",
-        "shot on a DSLR / studio product photography",
-        "pure white seamless background",
-        "realistic natural shadow",
-        "no plate, no bowl, no garnish, no props",
-        "do not change the product shape, material, texture or color from the reference image",
-        "match the reference image exactly"
-    ]
-    
-    constraint_text = ", ".join(constraints)
-    
-    if name:
-        prompt = f"{name}. {constraint_text}. {base_prompt}"
+    if studio_mode:
+        constraints = [
+            "real product photo, studio product photography, DSLR",
+            "pure white seamless background",
+            "single product only",
+            "natural soft shadow under product",
+            "centered, sharp focus",
+            "do not add any text, logos, labels, props, plates, bowls, hands",
+            "match the reference image shape, material, texture and color"
+        ]
+        constraint_text = ", ".join(constraints)
+        
+        if name:
+            prompt = f"{name}. {constraint_text}. {base_prompt}"
+        else:
+            prompt = f"{constraint_text}. {base_prompt}"
     else:
-        prompt = f"{constraint_text}. {base_prompt}"
+        # No wrapping, use base prompt as-is
+        if name:
+            prompt = f"{name}. {base_prompt}"
+        else:
+            prompt = base_prompt
     
     return prompt
 
-def build_strict_negative(user_negative: str) -> str:
+def build_strict_negative(user_negative: str, studio_mode: bool = True) -> str:
     """
     Build negative prompt with mandatory anti-placeholder tokens.
     Always appends mandatory tokens even if user clears the field.
+    studio_mode: if True, add strong studio photo negative tokens
     """
     user_tokens = user_negative.strip() if user_negative else ""
     
-    if user_tokens:
-        # Combine user tokens with mandatory tokens
-        combined = f"{user_tokens}, {MANDATORY_NEGATIVE_TOKENS}"
+    if studio_mode:
+        # Strong negative tokens for studio photo mode
+        studio_negatives = (
+            "text, letters, watermark, logo, brand mark, overlay, "
+            "placeholder, mockup, template, "
+            "plate, bowl, napkin, table, garnish, sauce, jam, dessert, cheese, dairy, yogurt, "
+            "cartoon, illustration, 3d render, cgi, low quality, blurry"
+        )
+        
+        if user_tokens:
+            combined = f"{user_tokens}, {MANDATORY_NEGATIVE_TOKENS}, {studio_negatives}"
+        else:
+            combined = f"{MANDATORY_NEGATIVE_TOKENS}, {studio_negatives}"
     else:
-        # Use only mandatory tokens if user field is empty
-        combined = MANDATORY_NEGATIVE_TOKENS
+        # Standard mode: just use mandatory tokens
+        if user_tokens:
+            combined = f"{user_tokens}, {MANDATORY_NEGATIVE_TOKENS}"
+        else:
+            combined = MANDATORY_NEGATIVE_TOKENS
     
     return combined
 
-def clamp_init_strength(value: float, min_val: float = 0.50, max_val: float = 0.98) -> float:
-    """Clamp init_strength to safe range [0.50, 0.98]."""
+def clamp_init_strength(value: float, min_val: float = 0.70, max_val: float = 0.98) -> float:
+    """Clamp init_strength to safe range [0.70, 0.98]."""
     return max(min_val, min(max_val, value))
 
 def detect_extension_from_url(url: str) -> str:
@@ -476,6 +460,96 @@ def detect_extension_from_url(url: str) -> str:
         if lower.endswith(ext):
             return ext if ext != ".jpeg" else ".jpg"
     return ".png"
+
+def normalize_product_framing(image_path: Path, target_width: int, target_height: int, padding_ratio: float = 0.10) -> None:
+    """
+    Postprocess generated image for consistent "camera product shot framing":
+    - Detect non-white bounding box
+    - Crop to product with padding
+    - Paste centered on white canvas of target size
+    - Save over original file
+    
+    This standardizes composition and avoids weird extra whitespace.
+    Does NOT attempt to remove watermarks/overlays.
+    """
+    try:
+        with Image.open(image_path) as img:
+            # Convert to RGB if needed
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Convert to grayscale for threshold detection
+            gray = img.convert('L')
+            width, height = img.size
+            
+            # Find non-white bounding box (threshold: >240 is near-white)
+            # Scan from edges inward
+            left = 0
+            right = width - 1
+            top = 0
+            bottom = height - 1
+            
+            # Find left edge
+            for x in range(width):
+                col = [gray.getpixel((x, y)) for y in range(height)]
+                if any(p < 240 for p in col):
+                    left = x
+                    break
+            
+            # Find right edge
+            for x in range(width - 1, -1, -1):
+                col = [gray.getpixel((x, y)) for y in range(height)]
+                if any(p < 240 for p in col):
+                    right = x
+                    break
+            
+            # Find top edge
+            for y in range(height):
+                row = [gray.getpixel((x, y)) for x in range(width)]
+                if any(p < 240 for p in row):
+                    top = y
+                    break
+            
+            # Find bottom edge
+            for y in range(height - 1, -1, -1):
+                row = [gray.getpixel((x, y)) for x in range(width)]
+                if any(p < 240 for p in row):
+                    bottom = y
+                    break
+            
+            # If no non-white pixels found, skip processing
+            if left >= right or top >= bottom:
+                return
+            
+            # Calculate padding
+            bbox_width = right - left + 1
+            bbox_height = bottom - top + 1
+            pad_x = int(bbox_width * padding_ratio)
+            pad_y = int(bbox_height * padding_ratio)
+            
+            # Crop with padding (clamp to image bounds)
+            crop_left = max(0, left - pad_x)
+            crop_top = max(0, top - pad_y)
+            crop_right = min(width, right + 1 + pad_x)
+            crop_bottom = min(height, bottom + 1 + pad_y)
+            
+            cropped = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+            
+            # Create white canvas of target size
+            canvas = Image.new('RGB', (target_width, target_height), (255, 255, 255))
+            
+            # Calculate centering position
+            paste_x = (target_width - cropped.width) // 2
+            paste_y = (target_height - cropped.height) // 2
+            
+            # Paste centered
+            canvas.paste(cropped, (paste_x, paste_y))
+            
+            # Save over original
+            canvas.save(image_path, 'PNG')
+    except Exception as e:
+        # If processing fails, keep original image
+        pass
 
 def ensure_manifest(manifest_path: Path) -> None:
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -548,6 +622,10 @@ class App:
         self.pack_prompt = tk.StringVar(value=DEFAULT_PACK_PROMPT)
         self.piece_prompt = tk.StringVar(value=DEFAULT_PIECE_PROMPT)
         self.negative_prompt = tk.StringVar(value=DEFAULT_NEGATIVE)
+        
+        self.reject_watermarks_var = tk.BooleanVar(value=True)
+        self.studio_mode_var = tk.BooleanVar(value=True)
+        self.normalize_framing_var = tk.BooleanVar(value=False)
 
         self._build_ui()
         self._poll_log_queue()
@@ -620,6 +698,12 @@ class App:
         ttk.Entry(row2, textvariable=self.pack_strength_var, width=8).pack(side="left", padx=(6, 16))
         ttk.Label(row2, text="Piece init_strength").pack(side="left")
         ttk.Entry(row2, textvariable=self.piece_strength_var, width=8).pack(side="left", padx=(6, 16))
+        
+        row3 = ttk.Frame(settings)
+        row3.pack(fill="x", pady=(8, 0))
+        ttk.Checkbutton(row3, text="Reject refs with text/watermark overlays (recommended)", variable=self.reject_watermarks_var).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(row3, text="Studio Photo Mode", variable=self.studio_mode_var).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(row3, text="Normalize framing (postprocess)", variable=self.normalize_framing_var).pack(side="left")
 
         # Prompts
         prompts = ttk.LabelFrame(self.root, text="Prompts", padding=pad)
@@ -743,6 +827,9 @@ class App:
             pack_prompt=self.pack_prompt.get().strip(),
             piece_prompt=self.piece_prompt.get().strip(),
             negative_prompt=self.negative_prompt.get().strip(),
+            reject_watermarks=bool(self.reject_watermarks_var.get()),
+            studio_mode=bool(self.studio_mode_var.get()),
+            normalize_framing=bool(self.normalize_framing_var.get()),
         )
 
     def on_test_api(self):
@@ -787,25 +874,25 @@ class App:
 
             for r in rows:
                 sku = r["sku"]
-                pack_refs = find_ref_images(s.pack_dir, sku, "pack")
-                piece_refs = find_ref_images(s.piece_dir, sku, "piece")
+                pack_ref = find_ref_image(s.pack_dir, sku, "pack")
+                piece_ref = find_ref_image(s.piece_dir, sku, "piece")
 
                 will_do_any = False
 
                 if s.gen_pack:
-                    if not pack_refs:
+                    if not pack_ref:
                         missing_pack += 1
                         self._log(f"[MISSING PACK] {sku}")
                     else:
-                        self._log(f"[OK PACK] {sku} refs={len(pack_refs)}")
+                        self._log(f"[OK PACK] {sku} ref={pack_ref.name}")
                 if s.gen_piece:
-                    if not piece_refs:
+                    if not piece_ref:
                         missing_piece += 1
                         self._log(f"[MISSING PIECE] {sku}")
                     else:
-                        self._log(f"[OK PIECE] {sku} refs={len(piece_refs)}")
+                        self._log(f"[OK PIECE] {sku} ref={piece_ref.name}")
 
-                if (s.gen_pack and pack_refs) or (s.gen_piece and piece_refs):
+                if (s.gen_pack and pack_ref) or (s.gen_piece and piece_ref):
                     will_do_any = True
 
                 if will_do_any:
@@ -866,17 +953,17 @@ class App:
                 sku = r["sku"]
                 name = r.get("name", "")
                 folder_name = safe_folder_name(sku, name)
-                pack_refs = find_ref_images(s.pack_dir, sku, "pack")
-                piece_refs = find_ref_images(s.piece_dir, sku, "piece")
+                pack_ref = find_ref_image(s.pack_dir, sku, "pack")
+                piece_ref = find_ref_image(s.piece_dir, sku, "piece")
 
                 out_sku_dir = s.output_dir / folder_name
                 out_pack = out_sku_dir / f"{sku}__pack.png"
                 out_piece = out_sku_dir / f"{sku}__piece.png"
 
-                if s.gen_pack and pack_refs:
+                if s.gen_pack and pack_ref:
                     if not (s.skip_existing and out_pack.exists()):
                         planned += 1
-                if s.gen_piece and piece_refs:
+                if s.gen_piece and piece_ref:
                     if not (s.skip_existing and out_piece.exists()):
                         planned += 1
 
@@ -901,8 +988,8 @@ class App:
                 name = r.get("name", "")
                 folder_name = safe_folder_name(sku, name)
 
-                pack_refs = find_ref_images(s.pack_dir, sku, "pack")
-                piece_refs = find_ref_images(s.piece_dir, sku, "piece")
+                pack_ref = find_ref_image(s.pack_dir, sku, "pack")
+                piece_ref = find_ref_image(s.piece_dir, sku, "piece")
 
                 out_sku_dir = s.output_dir / folder_name
                 out_sku_dir.mkdir(parents=True, exist_ok=True)
@@ -920,26 +1007,32 @@ class App:
 
                 # --- PACK (optional) ---
                 if s.gen_pack:
-                    if not pack_refs:
-                        self._log(f"[SKIP] {sku} Missing PACK refs")
+                    if not pack_ref:
+                        self._log(f"[SKIP] {sku} Missing PACK ref")
                         continue
                     
+                    # Watermark detection
+                    if detect_watermark_overlay(pack_ref):
+                        if s.reject_watermarks:
+                            self._log(f"[SKIP] {sku} pack ref looks like it contains text/watermark overlay. Please use a clean photo/reference.")
+                            continue
+                        else:
+                            self._log(f"[WARNING] {sku} pack ref may contain text/watermark overlay, but continuing (reject_watermarks is OFF).")
+                    
                     if not (s.skip_existing and out_pack.exists()):
-                        # Select primary ref image
-                        primary_pack_ref = select_primary_ref_image(pack_refs)
                         self.status_var.set(f"{sku}: uploading pack ref…")
-                        self._log(f"[{sku}] Selected primary pack ref: {primary_pack_ref.name}")
-                        pack_init_id = client.upload_init_image(primary_pack_ref)
+                        self._log(f"[{sku}] Using pack ref: {pack_ref.name}")
+                        pack_init_id = client.upload_init_image(pack_ref)
                         
-                        # Build strict prompt
-                        pack_prompt_text = build_strict_prompt("pack", s.pack_prompt, name)
+                        # Build strict prompt with studio mode
+                        pack_prompt_text = build_strict_prompt("pack", s.pack_prompt, name, studio_mode=s.studio_mode)
                         
                         # Clamp init_strength
                         effective_strength = clamp_init_strength(s.pack_strength)
                         current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
                         
                         # Debug payload log
-                        self._log(f"[PAYLOAD] {sku} PACK | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | init_strength={effective_strength:.2f} | ref={primary_pack_ref.name}")
+                        self._log(f"[PAYLOAD] {sku} PACK | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | init_strength={effective_strength:.2f} | ref={pack_ref.name}")
 
                         self.status_var.set(f"{sku}: generating PACK…")
                         gen_id, cost = client.create_generation(
@@ -953,12 +1046,18 @@ class App:
                             num_images=s.pack_num_images,
                             inference_steps=s.inference_steps,
                             model_profile=s.model_profile,
+                            studio_mode=s.studio_mode,
                         )
                         
                         self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
 
                         urls = client.wait_for_urls(gen_id, poll_s=s.poll_s, timeout_s=s.timeout_s)
                         client.download(urls[0], out_pack)
+                        
+                        # Optional postprocess for framing
+                        if s.normalize_framing:
+                            normalize_product_framing(out_pack, s.width, s.height)
+                            self._log(f"[{sku}] Applied framing normalization to PACK")
                         
                         # Save settings.json
                         settings_json = {
@@ -999,26 +1098,32 @@ class App:
 
                 # --- PIECE (optional) ---
                 if s.gen_piece:
-                    if not piece_refs:
-                        self._log(f"[SKIP] {sku} Missing PIECE refs")
+                    if not piece_ref:
+                        self._log(f"[SKIP] {sku} Missing PIECE ref")
                         continue
                     
+                    # Watermark detection
+                    if detect_watermark_overlay(piece_ref):
+                        if s.reject_watermarks:
+                            self._log(f"[SKIP] {sku} piece ref looks like it contains text/watermark overlay. Please use a clean photo/reference.")
+                            continue
+                        else:
+                            self._log(f"[WARNING] {sku} piece ref may contain text/watermark overlay, but continuing (reject_watermarks is OFF).")
+                    
                     if not (s.skip_existing and out_piece.exists()):
-                        # Select primary ref image
-                        primary_piece_ref = select_primary_ref_image(piece_refs)
                         self.status_var.set(f"{sku}: uploading piece ref…")
-                        self._log(f"[{sku}] Selected primary piece ref: {primary_piece_ref.name}")
-                        piece_init_id = client.upload_init_image(primary_piece_ref)
+                        self._log(f"[{sku}] Using piece ref: {piece_ref.name}")
+                        piece_init_id = client.upload_init_image(piece_ref)
                         
-                        # Build strict prompt
-                        piece_prompt_text = build_strict_prompt("piece", s.piece_prompt, name)
+                        # Build strict prompt with studio mode
+                        piece_prompt_text = build_strict_prompt("piece", s.piece_prompt, name, studio_mode=s.studio_mode)
                         
                         # Clamp init_strength
                         effective_strength = clamp_init_strength(s.piece_strength)
                         current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
                         
                         # Debug payload log
-                        self._log(f"[PAYLOAD] {sku} PIECE | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | init_strength={effective_strength:.2f} | ref={primary_piece_ref.name}")
+                        self._log(f"[PAYLOAD] {sku} PIECE | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | init_strength={effective_strength:.2f} | ref={piece_ref.name}")
 
                         self.status_var.set(f"{sku}: generating PIECE…")
                         gen_id2, cost2 = client.create_generation(
@@ -1032,12 +1137,18 @@ class App:
                             num_images=s.piece_num_images,
                             inference_steps=s.inference_steps,
                             model_profile=s.model_profile,
+                            studio_mode=s.studio_mode,
                         )
                         
                         self._log(f"[{sku}] PIECE gen_id={gen_id2} cost={cost2}")
 
                         urls2 = client.wait_for_urls(gen_id2, poll_s=s.poll_s, timeout_s=s.timeout_s)
                         client.download(urls2[0], out_piece)
+                        
+                        # Optional postprocess for framing
+                        if s.normalize_framing:
+                            normalize_product_framing(out_piece, s.width, s.height)
+                            self._log(f"[{sku}] Applied framing normalization to PIECE")
                         
                         # Save settings.json
                         settings_json = {
