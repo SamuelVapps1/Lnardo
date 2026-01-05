@@ -1,50 +1,31 @@
-# --- Secrets ---
-.env
-.env.*
-*.key
-*.pem
-
-# --- Python ---
+# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-.pytest_cache/
-.mypy_cache/
-.pyre/
-.ruff_cache/
-pip-wheel-metadata/
-*.egg-info/
-.eggs/
-
-# --- Virtual env ---
-.venv/
+*$py.class
+*.so
+.Python
+env/
 venv/
 ENV/
-env/
-
-# --- OS ---
-.DS_Store
-Thumbs.db
-
-# --- IDEs / Editors ---
-.vscode/
-.idea/
-*.iml
-
-# Cursor (optional)
-.cursor/
-.cursor-cache/
-
-# --- Outputs / generated assets ---
-output/
-outputs/
-downloads/
-tmp/
-temp/
-*.log
-
-# --- Packaging / build (PyInstaller) ---
 build/
 dist/
+*.egg-info/
+
+# PyInstaller
 *.spec
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Workspace (user data)
+Documents/LnardoTool/
+
+# Build artifacts
+*.exe
+*.log
+
+# Archive (old versions)
+archive/

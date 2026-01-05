@@ -1,6 +1,8 @@
 # LnardoTool - Leonardo AI Batch Generator
 
-Professional Windows desktop application for batch generating product photos using Leonardo AI API.
+**Windows-only** desktop application for batch generating product photos using Leonardo AI API.
+
+> **Note**: This application is Windows-only. It uses Windows-specific features (`os.startfile`, PyInstaller Windows build, Inno Setup installer).
 
 ## Features
 
@@ -27,9 +29,12 @@ Professional Windows desktop application for batch generating product photos usi
 
 #### Prerequisites
 
-- Python 3.12+
-- PyInstaller
-- Inno Setup (for installer)
+- **Windows 10/11**
+- Python 3.12+ (from [python.org](https://www.python.org/downloads/) - includes Tkinter)
+- PyInstaller: `pip install pyinstaller`
+- Inno Setup (for installer) - [download](https://jrsoftware.org/isinfo.php)
+
+**Important**: Python must include Tkinter (standard Windows python.org install includes it). If you get `ModuleNotFoundError: No module named 'tkinter'`, reinstall Python from python.org and ensure "tcl/tk" components are included.
 
 #### Build Steps
 
@@ -39,12 +44,20 @@ Professional Windows desktop application for batch generating product photos usi
    ```
 
 2. **Prepare icon (optional):**
-   - Place `app.ico` in `assets/` folder
-   - If missing, PyInstaller will use default icon
+   - Create `assets/` folder if it doesn't exist
+   - Place `app.ico` in `assets/` folder to use custom icon
+   - If icon is missing, PyInstaller will use default Windows icon
 
 3. **Build executable:**
+   
+   **With icon** (if `assets/app.ico` exists):
    ```bash
    pyinstaller --noconsole --onedir --name LnardoTool --icon assets/app.ico app.py
+   ```
+   
+   **Without icon** (uses default):
+   ```bash
+   pyinstaller --noconsole --onedir --name LnardoTool app.py
    ```
 
 4. **Test the build:**
@@ -54,7 +67,8 @@ Professional Windows desktop application for batch generating product photos usi
 5. **Create installer (optional):**
    - Open `installer/lnardo.iss` in Inno Setup Compiler
    - Build → Compile
-   - Installer will be in `installer/` folder
+   - Installer will be created as `installer/LnardoTool-Setup.exe`
+   - **Note**: Icon in installer is optional. If `assets/app.ico` doesn't exist, the `SetupIconFile` line in `lnardo.iss` is commented out.
 
 ## Workspace Structure
 
@@ -109,9 +123,21 @@ Documents\LnardoTool\
 
 ## Requirements
 
-- Windows 10/11
+- **Windows 10/11** (application is Windows-only)
+- Python 3.12+ with Tkinter (standard python.org install)
 - Leonardo AI API key
 - Internet connection
+
+## System Requirements
+
+- **OS**: Windows 10/11 only
+- **Python**: 3.12+ with Tkinter support
+- **Dependencies**: See `requirements.txt`
+  - `requests` - API communication
+  - `python-dotenv` - Environment variable management
+  - `Pillow` - Image processing
+  - `numpy` - Image analysis
+  - `tkinter` - GUI (included with standard Python install)
 
 ## License
 
