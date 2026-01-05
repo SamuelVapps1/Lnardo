@@ -5,6 +5,7 @@ import re
 import statistics
 import threading
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue, Empty
@@ -21,9 +22,43 @@ from tkinter import ttk, messagebox, filedialog
 # --- Leonardo REST base ---
 BASE_URL = "https://cloud.leonardo.ai/api/rest/v1"  # official base
 
-# Load .env early from the same folder as this script (works regardless of CWD)
-ENV_PATH = Path(__file__).with_name(".env")
-load_dotenv(dotenv_path=ENV_PATH, override=False)
+# --- Workspace Setup ---
+def get_workspace_dir() -> Path:
+    """Get workspace directory in Documents\LnardoTool"""
+    user_profile = os.getenv("USERPROFILE", os.path.expanduser("~"))
+    workspace = Path(user_profile) / "Documents" / "LnardoTool"
+    return workspace
+
+def ensure_workspace() -> Path:
+    """Create workspace structure if missing. Returns workspace path."""
+    workspace = get_workspace_dir()
+    
+    # Create directories
+    (workspace / "input" / "pack").mkdir(parents=True, exist_ok=True)
+    (workspace / "input" / "piece").mkdir(parents=True, exist_ok=True)
+    (workspace / "output").mkdir(parents=True, exist_ok=True)
+    
+    # Create skus.csv template if missing
+    csv_path = workspace / "skus.csv"
+    if not csv_path.exists():
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["sku", "name"])
+            writer.writerow(["EXAMPLE001", "Example Product"])
+    
+    # Create .env.example if missing
+    env_example = workspace / ".env.example"
+    if not env_example.exists():
+        with env_example.open("w", encoding="utf-8") as f:
+            f.write("LEONARDO_API_KEY=PASTE_YOUR_KEY_HERE\n")
+            f.write("LEONARDO_MODEL_ID=b24e16ff-06e3-43eb-8d33-4416c2d75876\n")
+            f.write("# Optional: LEONARDO_HQ_MODEL_ID=5c232a9e-9061-4777-980a-ddc8e65647c6\n")
+    
+    return workspace
+
+# Initialize workspace on import
+WORKSPACE_DIR = ensure_workspace()
+ENV_PATH = WORKSPACE_DIR / ".env"
 
 # Model IDs (hardcoded for runtime switching)
 MODEL_CHEAP = "b24e16ff-06e3-43eb-8d33-4416c2d75876"  # Lightning XL
@@ -113,6 +148,32 @@ class Settings:
     normalize_framing: bool = False  # Optional postprocess for consistent framing
     enhance_refs: bool = True  # Enhance blurry refs (denoise+upscale+sharpen)
 
+# Retry logic for transient API errors
+RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRY_DELAYS = [2, 5, 10]  # seconds
+
+def retry_api_call(func, *args, **kwargs):
+    """Retry API call with exponential backoff on transient errors."""
+    last_error = None
+    for attempt, delay in enumerate(RETRY_DELAYS):
+        try:
+            return func(*args, **kwargs)
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code in RETRY_STATUS_CODES:
+                last_error = e
+                if attempt < len(RETRY_DELAYS) - 1:
+                    time.sleep(delay)
+                    continue
+            raise
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_error = e
+            if attempt < len(RETRY_DELAYS) - 1:
+                time.sleep(delay)
+                continue
+            raise
+    if last_error:
+        raise last_error
+
 class LeonardoClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -129,17 +190,21 @@ class LeonardoClient:
 
     def get_me(self) -> Dict[str, Any]:
         # official endpoint: GET /me
-        r = self.session.get(f"{BASE_URL}/me", headers=self.headers_get, timeout=30)
-        r.raise_for_status()
-        return r.json()
+        def _call():
+            r = self.session.get(f"{BASE_URL}/me", headers=self.headers_get, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        return retry_api_call(_call)
 
     def init_image_upload(self, extension: str) -> Dict[str, Any]:
         # POST /init-image returns presigned S3 details
-        payload = {"extension": extension}
-        r = self.session.post(f"{BASE_URL}/init-image", headers=self.headers_json, json=payload, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        return data["uploadInitImage"]
+        def _call():
+            payload = {"extension": extension}
+            r = self.session.post(f"{BASE_URL}/init-image", headers=self.headers_json, json=payload, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            return data["uploadInitImage"]
+        return retry_api_call(_call)
 
     def upload_init_image(self, file_path: Path) -> str:
         ext = file_path.suffix.lower()
@@ -223,22 +288,25 @@ class LeonardoClient:
                 f"(1e60896f-3c26-4296-8ecc-53e2afecc132)."
             )
 
-        r = self.session.post(f"{BASE_URL}/generations", headers=self.headers_json, json=payload, timeout=60)
-        if not r.ok:
-            txt = r.text or ""
-            # Actionable message for your exact failure
-            if r.status_code == 400 and "Image to image defaults do not exist for model" in txt:
-                raise RuntimeError(
-                    "Leonardo API 400: Vybraný model nepodporuje image-to-image cez init_image_id.\n"
-                    f"Aktuálne modelId: {model_id}\n"
-                    "Fix: nastav v .env LEONARDO_MODEL_ID na SDXL model (napr. Leonardo Vision XL) "
-                    "a reštartuj appku.\n"
-                    f"Raw: {txt}"
-                )
-            # Toto ti povie presný dôvod 400 (chýbajúci field, zlá hodnota, atď.)
-            raise RuntimeError(f"Leonardo API error {r.status_code}: {r.text}")
-        r.raise_for_status()
-        data = r.json()
+        def _call():
+            r = self.session.post(f"{BASE_URL}/generations", headers=self.headers_json, json=payload, timeout=60)
+            if not r.ok:
+                txt = r.text or ""
+                # Actionable message for your exact failure
+                if r.status_code == 400 and "Image to image defaults do not exist for model" in txt:
+                    raise RuntimeError(
+                        "Leonardo API 400: Vybraný model nepodporuje image-to-image cez init_image_id.\n"
+                        f"Aktuálne modelId: {model_id}\n"
+                        "Fix: nastav v .env LEONARDO_MODEL_ID na SDXL model (napr. Leonardo Vision XL) "
+                        "a reštartuj appku.\n"
+                        f"Raw: {txt}"
+                    )
+                # Toto ti povie presný dôvod 400 (chýbajúci field, zlá hodnota, atď.)
+                raise RuntimeError(f"Leonardo API error {r.status_code}: {r.text}")
+            r.raise_for_status()
+            return r.json()
+        
+        data = retry_api_call(_call)
 
         job = data.get("sdGenerationJob") or {}
         gen_id = job.get("generationId")
@@ -249,9 +317,11 @@ class LeonardoClient:
         return gen_id, cost
 
     def get_generation(self, gen_id: str) -> Dict[str, Any]:
-        r = self.session.get(f"{BASE_URL}/generations/{gen_id}", headers=self.headers_get, timeout=30)
-        r.raise_for_status()
-        return r.json()
+        def _call():
+            r = self.session.get(f"{BASE_URL}/generations/{gen_id}", headers=self.headers_get, timeout=30)
+            r.raise_for_status()
+            return r.json()
+        return retry_api_call(_call)
 
     def wait_for_urls(self, gen_id: str, poll_s: float, timeout_s: int) -> List[str]:
         start = time.time()
@@ -283,52 +353,84 @@ class LeonardoClient:
                     if chunk:
                         f.write(chunk)
 
-def load_api_key() -> str:
-    # already loaded at import time, but keep as safety no-op
-    load_dotenv(dotenv_path=ENV_PATH, override=False)
+def load_api_key(workspace_dir: Optional[Path] = None) -> str:
+    """Load API key from workspace .env file. Shows wizard if missing."""
+    if workspace_dir is None:
+        workspace_dir = WORKSPACE_DIR
+    
+    env_path = workspace_dir / ".env"
+    load_dotenv(dotenv_path=env_path, override=False)
     api_key = os.getenv("LEONARDO_API_KEY")
+    
     if not api_key:
-        raise RuntimeError("Missing LEONARDO_API_KEY. Create .env from .env.example and paste your key.")
+        # API key missing - will be handled by GUI wizard
+        raise RuntimeError("API_KEY_MISSING")  # Special error code for wizard
     return api_key
 
-def safe_folder_name(sku: str, name: str, max_len: int = 120) -> str:
+def save_api_key_to_env(api_key: str, model_id: Optional[str] = None, workspace_dir: Optional[Path] = None) -> None:
+    """Save API key and optional model ID to workspace .env file."""
+    if workspace_dir is None:
+        workspace_dir = WORKSPACE_DIR
+    
+    env_path = workspace_dir / ".env"
+    lines = []
+    
+    # Read existing .env if it exists
+    if env_path.exists():
+        with env_path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+    
+    # Update or add LEONARDO_API_KEY
+    updated = False
+    new_lines = []
+    for line in lines:
+        if line.startswith("LEONARDO_API_KEY="):
+            new_lines.append(f"LEONARDO_API_KEY={api_key}\n")
+            updated = True
+        elif model_id and line.startswith("LEONARDO_MODEL_ID="):
+            new_lines.append(f"LEONARDO_MODEL_ID={model_id}\n")
+        else:
+            new_lines.append(line)
+    
+    if not updated:
+        new_lines.append(f"LEONARDO_API_KEY={api_key}\n")
+    
+    if model_id and not any("LEONARDO_MODEL_ID=" in line for line in new_lines):
+        new_lines.append(f"LEONARDO_MODEL_ID={model_id}\n")
+    
+    # Write back
+    with env_path.open("w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+def safe_folder_name(sku: str, name: str, max_len: int = 80) -> str:
     """
     Create a safe folder name from SKU and name for Windows filesystem.
-    Returns {sku}_{sanitized_name} or just {sku} if name is empty.
-    Sanitized name: lowercase, spaces -> '-', remove invalid chars, limit length.
+    Returns {sku}__{sanitized_name} (double underscore) or just {sku} if name is empty.
+    Sanitized name: remove invalid chars, collapse whitespace, limit length to 80 chars total.
     Always keeps full SKU, truncates name if needed.
     """
     if not name or not name.strip():
         return sku
     
-    # Clean name: replace invalid Windows chars, trim, collapse spaces
-    invalid_chars = '<>:"/\\|?*'
+    # Clean name: replace invalid Windows chars
+    invalid_chars = r'<>:"/\|?*'
     cleaned = name.strip()
     for char in invalid_chars:
-        cleaned = cleaned.replace(char, "-")
+        cleaned = cleaned.replace(char, "")
     
-    # Collapse multiple spaces to single space, then replace with dashes
+    # Collapse whitespace
     cleaned = re.sub(r'\s+', ' ', cleaned)
-    cleaned = cleaned.replace(' ', '-')
+    cleaned = cleaned.strip()
     
-    # Lowercase
-    cleaned = cleaned.lower()
-    
-    # Remove multiple consecutive dashes
-    cleaned = re.sub(r'-+', '-', cleaned)
-    
-    # Remove leading/trailing dashes
-    cleaned = cleaned.strip('-')
-    
-    # Build folder name
-    folder_name = f"{sku}_{cleaned}"
+    # Build folder name with double underscore
+    folder_name = f"{sku}__{cleaned}"
     
     # Truncate if too long, but always keep full SKU
     if len(folder_name) > max_len:
-        # Keep SKU + "_" + truncated name
-        available_for_name = max_len - len(sku) - 1  # -1 for underscore
+        # Keep SKU + "__" + truncated name
+        available_for_name = max_len - len(sku) - 2  # -2 for double underscore
         if available_for_name > 0:
-            folder_name = f"{sku}_{cleaned[:available_for_name]}"
+            folder_name = f"{sku}__{cleaned[:available_for_name]}"
         else:
             # If SKU itself is too long, just return SKU (shouldn't happen normally)
             folder_name = sku
@@ -700,16 +802,18 @@ def normalize_product_framing(image_path: Path, target_width: int, target_height
         pass
 
 def ensure_manifest(manifest_path: Path) -> None:
+    """Create manifest CSV with per-SKU tracking columns."""
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     if not manifest_path.exists():
         with manifest_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
                 "sku", "name", "variant", "generation_id", "api_credit_cost", "file_path",
-                "profile", "width", "height", "steps", "alchemy", "init_strength", "modelId"
+                "status", "error"
             ])
 
 def append_manifest(manifest_path: Path, row: List[Any]) -> None:
+    """Append row to manifest CSV. Row should match: sku, name, variant, gen_id, cost, file_path, status, error"""
     with manifest_path.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(row)
@@ -745,11 +849,15 @@ class App:
         self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
 
-        # Defaults
-        self.csv_var = tk.StringVar(value=str(Path("skus.csv").resolve()))
-        self.pack_dir_var = tk.StringVar(value=str(Path("input/pack").resolve()))
-        self.piece_dir_var = tk.StringVar(value=str(Path("input/piece").resolve()))
-        self.output_dir_var = tk.StringVar(value=str(Path("output").resolve()))
+        # Workspace paths (default to workspace directory)
+        self.workspace_dir = WORKSPACE_DIR
+        self.csv_var = tk.StringVar(value=str(self.workspace_dir / "skus.csv"))
+        self.pack_dir_var = tk.StringVar(value=str(self.workspace_dir / "input" / "pack"))
+        self.piece_dir_var = tk.StringVar(value=str(self.workspace_dir / "input" / "piece"))
+        self.output_dir_var = tk.StringVar(value=str(self.workspace_dir / "output"))
+        
+        # UI control references for locking
+        self.ui_controls: List[Any] = []
 
         self.width_var = tk.IntVar(value=1024)
         self.height_var = tk.IntVar(value=1024)
@@ -917,13 +1025,60 @@ class App:
         if p:
             var.set(p)
 
+    def on_open_workspace(self):
+        """Open workspace folder in Windows Explorer."""
+        try:
+            os.startfile(str(self.workspace_dir))  # Windows
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot open workspace folder: {e}")
+    
     def on_open_output(self):
+        """Legacy method - redirects to workspace output."""
         out_dir = Path(self.output_dir_var.get())
         out_dir.mkdir(parents=True, exist_ok=True)
         try:
             os.startfile(str(out_dir))  # Windows
         except Exception as e:
             messagebox.showerror("Error", f"Cannot open folder: {e}")
+    
+    def _lock_ui(self, locked: bool):
+        """Lock/unlock UI controls during generation."""
+        state = "disabled" if locked else "normal"
+        
+        # Lock path entries
+        for widget in self.root.winfo_children():
+            self._lock_widget_recursive(widget, state, ["stop_btn", "start_btn"])
+        
+        # Enable/disable stop button
+        if locked:
+            self.stop_btn.config(state="normal")
+            self.start_btn.config(state="disabled")
+        else:
+            self.stop_btn.config(state="disabled")
+            self.start_btn.config(state="normal")
+    
+    def _lock_widget_recursive(self, widget, state: str, exclude_names: List[str]):
+        """Recursively lock/unlock widgets, excluding certain names."""
+        widget_class = widget.winfo_class()
+        widget_name = str(widget)
+        
+        # Skip stop button and other excluded widgets
+        if any(exc in widget_name for exc in exclude_names):
+            return
+        
+        # Lock Entry, Spinbox, Combobox, Checkbutton, Button (except excluded)
+        if widget_class in ("Entry", "Spinbox", "TCombobox", "TCheckbutton", "TButton"):
+            try:
+                widget.config(state=state)
+            except:
+                pass
+        
+        # Recurse into children
+        try:
+            for child in widget.winfo_children():
+                self._lock_widget_recursive(child, state, exclude_names)
+        except:
+            pass
 
     def apply_profile(self, profile: str):
         """Apply profile preset to UI (width, height, steps, alchemy, model profile, strengths)."""
