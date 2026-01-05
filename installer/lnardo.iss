@@ -4,7 +4,7 @@
 [Setup]
 AppName=LnardoTool
 AppVersion=1.0
-DefaultDirName={pf}\LnardoTool
+DefaultDirName={localappdata}\LnardoTool
 DefaultGroupName=LnardoTool
 OutputDir=installer
 OutputBaseFilename=LnardoTool-Setup
@@ -12,6 +12,7 @@ Compression=lzma
 SolidCompression=yes
 SetupIconFile=..\assets\app.ico
 UninstallDisplayIcon={app}\LnardoTool.exe
+PrivilegesRequired=lowest
 
 [Files]
 Source: "..\dist\LnardoTool\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs

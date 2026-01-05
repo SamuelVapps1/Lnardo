@@ -867,7 +867,6 @@ class App:
         self.alchemy_var = tk.BooleanVar(value=True)
         self.skip_existing_var = tk.BooleanVar(value=True)
         self.steps_var = tk.IntVar(value=12)
-        self.hq_var = tk.BooleanVar(value=False)
         self.profile_var = tk.StringVar(value="CHEAP")
 
         self.gen_pack_var = tk.BooleanVar(value=True)
@@ -953,7 +952,6 @@ class App:
         steps_entry = ttk.Entry(row1, textvariable=self.steps_var, width=6)
         steps_entry.pack(side="left", padx=(6, 16))
 
-        ttk.Checkbutton(row1, text="HQ model", variable=self.hq_var).pack(side="left", padx=(0, 12))
         preset_cheap_btn = ttk.Button(row1, text="Preset: CHEAP", command=self.apply_preset_cheap)
         preset_cheap_btn.pack(side="left", padx=(0, 8))
         preset_hq_btn = ttk.Button(row1, text="Preset: HQ", command=self.apply_preset_hq)
@@ -1127,12 +1125,13 @@ class App:
     
     def _lock_ui(self, locked: bool):
         """Lock/unlock UI controls during generation using whitelist approach."""
-        state = "disabled" if locked else "normal"
-        
         # Lock/unlock all widgets in whitelist
         for widget in self.lockable_widgets:
             try:
-                widget.config(state=state)
+                if isinstance(widget, ttk.Combobox):
+                    widget.config(state="disabled" if locked else "readonly")
+                else:
+                    widget.config(state="disabled" if locked else "normal")
             except:
                 pass
         
@@ -1153,8 +1152,6 @@ class App:
             self.alchemy_var.set(True)
             self.pack_strength_var.set(0.9)
             self.piece_strength_var.set(0.9)
-            if hasattr(self, 'hq_var'):
-                self.hq_var.set(False)
             self.profile_var.set("CHEAP")
             self._log(f"Applied profile CHEAP: 768×768, steps=30, alchemy=ON, strength=0.9")
         elif profile == "HQ":
@@ -1164,8 +1161,6 @@ class App:
             self.alchemy_var.set(True)
             self.pack_strength_var.set(0.9)
             self.piece_strength_var.set(0.9)
-            if hasattr(self, 'hq_var'):
-                self.hq_var.set(True)
             self.profile_var.set("HQ")
             self._log(f"Applied profile HQ: 1024×1024, steps=30, alchemy=ON, strength=0.9")
 
@@ -1490,7 +1485,7 @@ class App:
                             self._log(f"[{sku}] Saved PACK -> {out_pack.name}")
 
                             done += 1
-                            self.progress_var.set(done / planned * 100.0)
+                            self.set_progress(done / planned * 100.0)
                         except Exception as e:
                             error_msg = str(e)
                             self._log(f"[ERROR] {sku} PACK generation failed: {error_msg}")
