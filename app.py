@@ -12,7 +12,8 @@ from typing import Dict, Any, Optional, List, Tuple
 
 import requests
 from dotenv import load_dotenv
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageEnhance
+import numpy as np
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -52,26 +53,28 @@ I2I_UNSUPPORTED_MODEL_IDS = {
 ALLOWED_EXTS = [".jpg", ".jpeg", ".png", ".webp"]
 
 DEFAULT_PACK_PROMPT = (
-    "High-end ecommerce product photo. "
-    "Keep the exact same packaging design, text, logo, colors, and shape as the reference image. "
-    "Centered front-facing packshot on pure white seamless background, soft natural shadow under product, "
-    "neutral studio lighting, sharp focus, ultra realistic. "
-    "No extra objects, no added stickers, no redesign."
+    "photorealistic studio packshot, same packaging design and same text as reference, "
+    "centered, pure white seamless background, soft natural shadow, sharp focus, "
+    "realistic lighting, slight natural wrinkles/reflections, no redesign, no new labels"
 )
 
 DEFAULT_PIECE_PROMPT = (
-    "High-end macro ecommerce photo of a single piece of the treat. "
-    "Keep the exact shape, texture and color as the reference image. "
-    "Pure white seamless background, soft shadow, realistic details, sharp focus. "
-    "No extra pieces, no garnish, no stylization."
+    "photorealistic macro product photo, same treat piece as reference, "
+    "same shape/texture/color, centered on pure white seamless background, "
+    "soft shadow, sharp focus, realistic details, no plate, no props"
 )
 
-DEFAULT_NEGATIVE = (
-    "cartoon, illustration, anime, 3d render, cgi, low quality, blurry, "
-    "extra text, watermark, logo overlay, fake label, distorted packaging, "
-    "cheese, dairy, yogurt, dessert, jam, sauce, fruit, garnish, plate, bowl, "
-    "napkin, table setting, food styling, props, background objects"
+DEFAULT_PACK_NEGATIVE = (
+    "watermark, website logo overlay, extra stickers, new label, redesign, "
+    "cartoon, illustration, 3d, cgi, blurry, low quality"
 )
+
+DEFAULT_PIECE_NEGATIVE = (
+    "watermark, text, logo overlay, cartoon, illustration, 3d, cgi, blurry, "
+    "low quality, extra objects"
+)
+
+DEFAULT_NEGATIVE = DEFAULT_PACK_NEGATIVE  # Keep for backward compatibility
 
 MANDATORY_NEGATIVE_TOKENS = (
     "placeholder, mockup, template, generic, stock photo, "
@@ -108,6 +111,7 @@ class Settings:
     reject_watermarks: bool = True  # Reject refs with text/watermark overlays
     studio_mode: bool = True  # Studio Photo Mode
     normalize_framing: bool = False  # Optional postprocess for consistent framing
+    enhance_refs: bool = True  # Enhance blurry refs (denoise+upscale+sharpen)
 
 class LeonardoClient:
     def __init__(self, api_key: str):
@@ -178,6 +182,7 @@ class LeonardoClient:
         inference_steps: int = 12,
         model_profile: str = "CHEAP",
         studio_mode: bool = True,
+        variant: str = "pack",
     ) -> Tuple[str, Optional[int]]:
         """
         Create generation with strict requirements:
@@ -192,8 +197,8 @@ class LeonardoClient:
         
         model_id = MODEL_HQ if model_profile == "HQ" else MODEL_CHEAP
         
-        # Build strict negative prompt
-        strict_negative = build_strict_negative(negative_prompt, studio_mode=studio_mode)
+        # Build strict negative prompt (per-variant)
+        strict_negative = build_strict_negative(negative_prompt, variant=variant, studio_mode=studio_mode)
         
         payload: Dict[str, Any] = {
             "prompt": prompt,
@@ -386,6 +391,144 @@ def detect_watermark_overlay(image_path: Path, edge_threshold: float = 15.0, non
         # If we can't analyze, assume no watermark (don't block generation)
         return False
 
+# --- Image Preprocessing Functions ---
+
+BLUR_THRESHOLD = 0.0035  # Threshold for sharpness score (variance of edges)
+
+def estimate_sharpness(img: Image.Image) -> float:
+    """
+    Estimate image sharpness using edge variance.
+    Convert to grayscale, apply FIND_EDGES, return normalized variance.
+    """
+    try:
+        gray = img.convert('L')
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+        edge_array = np.array(edges, dtype=np.float32)
+        variance = float(np.var(edge_array))
+        # Normalize by dividing by max possible variance (255^2 = 65025)
+        normalized = variance / 65025.0
+        return normalized
+    except Exception:
+        return 0.0
+
+def autocrop_nonwhite(img: Image.Image, threshold: int = 248, pad_ratio: float = 0.10) -> Image.Image:
+    """
+    Auto-crop image to remove large white margins.
+    Finds bounding box of non-white pixels and crops with padding.
+    """
+    try:
+        # Convert to RGB if needed
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Convert to numpy array
+        arr = np.array(img)
+        h, w, c = arr.shape
+        
+        # Create mask: True where any channel < threshold (non-white)
+        mask = np.any(arr < threshold, axis=2)
+        
+        # If no non-white pixels, return original
+        if not np.any(mask):
+            return img
+        
+        # Find bounding box
+        rows = np.any(mask, axis=1)
+        cols = np.any(mask, axis=0)
+        
+        if not np.any(rows) or not np.any(cols):
+            return img
+        
+        top = np.argmax(rows)
+        bottom = len(rows) - np.argmax(rows[::-1])
+        left = np.argmax(cols)
+        right = len(cols) - np.argmax(cols[::-1])
+        
+        # Add padding
+        bbox_w = right - left
+        bbox_h = bottom - top
+        pad = int(max(bbox_w, bbox_h) * pad_ratio)
+        
+        # Clamp to image bounds
+        crop_left = max(0, left - pad)
+        crop_top = max(0, top - pad)
+        crop_right = min(w, right + pad)
+        crop_bottom = min(h, bottom + pad)
+        
+        cropped = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+        return cropped
+    except Exception:
+        return img
+
+def preprocess_ref_image(
+    in_path: Path,
+    out_path: Path,
+    target_w: int,
+    target_h: int,
+    enhance: bool = True
+) -> Tuple[Path, float]:
+    """
+    Preprocess reference image: auto-crop, resize, enhance, and compute sharpness.
+    Returns (out_path, sharpness_score).
+    """
+    try:
+        # Load image
+        img = Image.open(in_path)
+        
+        # Convert to RGB, composite on white if has alpha
+        if img.mode == 'RGBA':
+            white_bg = Image.new('RGB', img.size, (255, 255, 255))
+            white_bg.paste(img, mask=img.split()[3])  # Use alpha channel as mask
+            img = white_bg
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Auto-crop to remove huge white margins
+        img = autocrop_nonwhite(img)
+        
+        # Resize to fit inside target dimensions while keeping aspect ratio
+        img_w, img_h = img.size
+        scale = min(target_w / img_w, target_h / img_h)
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+        
+        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        
+        # Paste centered on pure white canvas
+        canvas = Image.new('RGB', (target_w, target_h), (255, 255, 255))
+        paste_x = (target_w - new_w) // 2
+        paste_y = (target_h - new_h) // 2
+        canvas.paste(img, (paste_x, paste_y))
+        img = canvas
+        
+        # Enhance if requested
+        if enhance:
+            # Mild denoise for JPEG artifacts
+            img = img.filter(ImageFilter.MedianFilter(size=3))
+            
+            # Unsharp mask for sharpening
+            img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=180, threshold=3))
+            
+            # Contrast enhancement
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(1.08)  # 1.05-1.10 range
+            
+            # Sharpness enhancement
+            enhancer = ImageEnhance.Sharpness(img)
+            img = enhancer.enhance(1.10)  # 1.05-1.15 range
+        
+        # Compute sharpness score on final image
+        sharpness_score = estimate_sharpness(img)
+        
+        # Save to output path (ensure parent dirs exist)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(out_path, 'PNG')
+        
+        return (out_path, sharpness_score)
+    except Exception as e:
+        # If preprocessing fails, return original path and low sharpness
+        return (in_path, 0.0)
+
 def build_strict_prompt(kind: str, base_prompt: str, name: str, studio_mode: bool = True) -> str:
     """
     Build a strict anti-placeholder prompt that forces real photography look.
@@ -419,33 +562,38 @@ def build_strict_prompt(kind: str, base_prompt: str, name: str, studio_mode: boo
     
     return prompt
 
-def build_strict_negative(user_negative: str, studio_mode: bool = True) -> str:
+def build_strict_negative(user_negative: str, variant: str = "pack", studio_mode: bool = True) -> str:
     """
     Build negative prompt with mandatory anti-placeholder tokens.
-    Always appends mandatory tokens even if user clears the field.
+    variant: "pack" or "piece" - uses different base negatives
     studio_mode: if True, add strong studio photo negative tokens
     """
     user_tokens = user_negative.strip() if user_negative else ""
     
+    # Use variant-specific base negative prompts
+    if variant == "pack":
+        base_negative = DEFAULT_PACK_NEGATIVE
+    else:  # piece
+        base_negative = DEFAULT_PIECE_NEGATIVE
+    
     if studio_mode:
         # Strong negative tokens for studio photo mode
         studio_negatives = (
-            "text, letters, watermark, logo, brand mark, overlay, "
             "placeholder, mockup, template, "
             "plate, bowl, napkin, table, garnish, sauce, jam, dessert, cheese, dairy, yogurt, "
             "cartoon, illustration, 3d render, cgi, low quality, blurry"
         )
         
         if user_tokens:
-            combined = f"{user_tokens}, {MANDATORY_NEGATIVE_TOKENS}, {studio_negatives}"
+            combined = f"{user_tokens}, {base_negative}, {studio_negatives}"
         else:
-            combined = f"{MANDATORY_NEGATIVE_TOKENS}, {studio_negatives}"
+            combined = f"{base_negative}, {studio_negatives}"
     else:
-        # Standard mode: just use mandatory tokens
+        # Standard mode: just use base negative
         if user_tokens:
-            combined = f"{user_tokens}, {MANDATORY_NEGATIVE_TOKENS}"
+            combined = f"{user_tokens}, {base_negative}"
         else:
-            combined = MANDATORY_NEGATIVE_TOKENS
+            combined = base_negative
     
     return combined
 
@@ -626,6 +774,7 @@ class App:
         self.reject_watermarks_var = tk.BooleanVar(value=True)
         self.studio_mode_var = tk.BooleanVar(value=True)
         self.normalize_framing_var = tk.BooleanVar(value=False)
+        self.enhance_refs_var = tk.BooleanVar(value=True)
 
         self._build_ui()
         self._poll_log_queue()
@@ -703,7 +852,8 @@ class App:
         row3.pack(fill="x", pady=(8, 0))
         ttk.Checkbutton(row3, text="Reject refs with text/watermark overlays (recommended)", variable=self.reject_watermarks_var).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(row3, text="Studio Photo Mode", variable=self.studio_mode_var).pack(side="left", padx=(0, 16))
-        ttk.Checkbutton(row3, text="Normalize framing (postprocess)", variable=self.normalize_framing_var).pack(side="left")
+        ttk.Checkbutton(row3, text="Normalize framing (postprocess)", variable=self.normalize_framing_var).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(row3, text="Enhance blurry refs (denoise+upscale+sharpen)", variable=self.enhance_refs_var).pack(side="left")
 
         # Prompts
         prompts = ttk.LabelFrame(self.root, text="Prompts", padding=pad)
@@ -830,6 +980,7 @@ class App:
             reject_watermarks=bool(self.reject_watermarks_var.get()),
             studio_mode=bool(self.studio_mode_var.get()),
             normalize_framing=bool(self.normalize_framing_var.get()),
+            enhance_refs=bool(self.enhance_refs_var.get()),
         )
 
     def on_test_api(self):
@@ -1020,19 +1171,33 @@ class App:
                             self._log(f"[WARNING] {sku} pack ref may contain text/watermark overlay, but continuing (reject_watermarks is OFF).")
                     
                     if not (s.skip_existing and out_pack.exists()):
+                        # Preprocess reference image
+                        prep_dir = out_sku_dir / "_prep"
+                        prep_pack = prep_dir / f"{sku}__pack_prep.png"
+                        prep_path, sharpness_score = preprocess_ref_image(
+                            pack_ref, prep_pack, s.width, s.height, enhance=s.enhance_refs
+                        )
+                        self._log(f"[{sku}] Preprocessed pack ref: sharpness={sharpness_score:.6f}")
+                        
+                        # Auto-tune init_strength based on sharpness
+                        base_strength = s.pack_strength
+                        if sharpness_score < BLUR_THRESHOLD:
+                            effective_strength = max(0.70, min(base_strength, 0.78))
+                        else:
+                            effective_strength = base_strength
+                        effective_strength = clamp_init_strength(effective_strength)
+                        
                         self.status_var.set(f"{sku}: uploading pack ref…")
-                        self._log(f"[{sku}] Using pack ref: {pack_ref.name}")
-                        pack_init_id = client.upload_init_image(pack_ref)
+                        self._log(f"[{sku}] Using pack ref: {pack_ref.name} (preprocessed: {prep_path.name})")
+                        pack_init_id = client.upload_init_image(prep_path)
                         
                         # Build strict prompt with studio mode
                         pack_prompt_text = build_strict_prompt("pack", s.pack_prompt, name, studio_mode=s.studio_mode)
                         
-                        # Clamp init_strength
-                        effective_strength = clamp_init_strength(s.pack_strength)
                         current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
                         
                         # Debug payload log
-                        self._log(f"[PAYLOAD] {sku} PACK | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | init_strength={effective_strength:.2f} | ref={pack_ref.name}")
+                        self._log(f"[PAYLOAD] {sku} PACK | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | sharpness={sharpness_score:.6f} base_strength={base_strength:.2f} effective_strength={effective_strength:.2f} | ref={pack_ref.name}")
 
                         self.status_var.set(f"{sku}: generating PACK…")
                         gen_id, cost = client.create_generation(
@@ -1047,6 +1212,7 @@ class App:
                             inference_steps=s.inference_steps,
                             model_profile=s.model_profile,
                             studio_mode=s.studio_mode,
+                            variant="pack",
                         )
                         
                         self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
@@ -1111,19 +1277,33 @@ class App:
                             self._log(f"[WARNING] {sku} piece ref may contain text/watermark overlay, but continuing (reject_watermarks is OFF).")
                     
                     if not (s.skip_existing and out_piece.exists()):
+                        # Preprocess reference image
+                        prep_dir = out_sku_dir / "_prep"
+                        prep_piece = prep_dir / f"{sku}__piece_prep.png"
+                        prep_path, sharpness_score = preprocess_ref_image(
+                            piece_ref, prep_piece, s.width, s.height, enhance=s.enhance_refs
+                        )
+                        self._log(f"[{sku}] Preprocessed piece ref: sharpness={sharpness_score:.6f}")
+                        
+                        # Auto-tune init_strength based on sharpness
+                        base_strength = s.piece_strength
+                        if sharpness_score < BLUR_THRESHOLD:
+                            effective_strength = max(0.70, min(base_strength, 0.78))
+                        else:
+                            effective_strength = base_strength
+                        effective_strength = clamp_init_strength(effective_strength)
+                        
                         self.status_var.set(f"{sku}: uploading piece ref…")
-                        self._log(f"[{sku}] Using piece ref: {piece_ref.name}")
-                        piece_init_id = client.upload_init_image(piece_ref)
+                        self._log(f"[{sku}] Using piece ref: {piece_ref.name} (preprocessed: {prep_path.name})")
+                        piece_init_id = client.upload_init_image(prep_path)
                         
                         # Build strict prompt with studio mode
                         piece_prompt_text = build_strict_prompt("piece", s.piece_prompt, name, studio_mode=s.studio_mode)
                         
-                        # Clamp init_strength
-                        effective_strength = clamp_init_strength(s.piece_strength)
                         current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
                         
                         # Debug payload log
-                        self._log(f"[PAYLOAD] {sku} PIECE | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | init_strength={effective_strength:.2f} | ref={piece_ref.name}")
+                        self._log(f"[PAYLOAD] {sku} PIECE | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | sharpness={sharpness_score:.6f} base_strength={base_strength:.2f} effective_strength={effective_strength:.2f} | ref={piece_ref.name}")
 
                         self.status_var.set(f"{sku}: generating PIECE…")
                         gen_id2, cost2 = client.create_generation(
@@ -1138,6 +1318,7 @@ class App:
                             inference_steps=s.inference_steps,
                             model_profile=s.model_profile,
                             studio_mode=s.studio_mode,
+                            variant="piece",
                         )
                         
                         self._log(f"[{sku}] PIECE gen_id={gen_id2} cost={cost2}")
