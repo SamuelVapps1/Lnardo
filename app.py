@@ -133,18 +133,19 @@ class LeonardoClient:
         num_images: int = 1,
     ) -> Tuple[str, Optional[int]]:
         payload: Dict[str, Any] = {
-            "modelId": LEONARDO_MODEL_ID,
             "prompt": prompt,
             "negative_prompt": negative_prompt,
-            "width": width,
-            "height": height,
-            "num_images": num_images,
+            "modelId": LEONARDO_MODEL_ID,
+            "width": int(width),
+            "height": int(height),
+            "num_images": 1,
             "alchemy": bool(alchemy),
-            "init_image_id": init_image_id,
-            "init_strength": float(init_strength),
-            # Leonardo FAQ recommends isInitImage true when using init_image_id
-            "isInitImage": True,
         }
+
+        # iba ak ideš image-to-image (máš init image)
+        if init_image_id:
+            payload["init_image_id"] = init_image_id
+            payload["init_strength"] = float(init_strength)
 
         r = self.session.post(f"{BASE_URL}/generations", headers=self.headers_json, json=payload, timeout=60)
         if not r.ok:
