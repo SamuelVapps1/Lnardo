@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -84,7 +85,7 @@ class Settings:
     skip_existing: bool = True
     inference_steps: int = 12
     model_profile: str = "CHEAP"  # CHEAP | HQ
-    pack_num_images: int = 2
+    pack_num_images: int = 1
     piece_num_images: int = 1
     # note: resolution controlled by width/height
     poll_s: float = 2.0
@@ -161,7 +162,8 @@ class LeonardoClient:
         num_images: int = 1,
         inference_steps: int = 12,
         model_profile: str = "CHEAP",
-    ) -> Tuple[str, Optional[int]]:
+        image_prompt_ids: Optional[List[str]] = None,
+    ) -> Optional[Tuple[str, Optional[int]]]:
         model_id = MODEL_HQ if model_profile == "HQ" else MODEL_CHEAP
         payload: Dict[str, Any] = {
             "prompt": prompt,
@@ -187,6 +189,10 @@ class LeonardoClient:
             payload["init_image_id"] = init_image_id
             payload["init_strength"] = float(init_strength)
 
+        # Add imagePrompts if provided (for multi-reference guidance)
+        if image_prompt_ids and len(image_prompt_ids) >= 1:
+            payload["imagePrompts"] = image_prompt_ids
+
         r = self.session.post(f"{BASE_URL}/generations", headers=self.headers_json, json=payload, timeout=60)
         if not r.ok:
             txt = r.text or ""
@@ -199,6 +205,9 @@ class LeonardoClient:
                     "a reštartuj appku.\n"
                     f"Raw: {txt}"
                 )
+            # If imagePrompts causes 400, return None to signal retry without it
+            if r.status_code == 400 and image_prompt_ids and ("imagePrompts" in txt.lower() or "image prompt" in txt.lower()):
+                return None
             # Toto ti povie presný dôvod 400 (chýbajúci field, zlá hodnota, atď.)
             raise RuntimeError(f"Leonardo API error {r.status_code}: {r.text}")
         r.raise_for_status()
@@ -255,6 +264,39 @@ def load_api_key() -> str:
         raise RuntimeError("Missing LEONARDO_API_KEY. Create .env from .env.example and paste your key.")
     return api_key
 
+def safe_folder_name(sku: str, name: str, max_len: int = 120) -> str:
+    """
+    Create a safe folder name from SKU and name for Windows filesystem.
+    Returns {sku}_{cleaned_name} or just {sku} if name is empty.
+    Always keeps full SKU, truncates name if needed.
+    """
+    if not name or not name.strip():
+        return sku
+    
+    # Clean name: replace invalid Windows chars, trim, collapse spaces
+    invalid_chars = '<>:"/\\|?*'
+    cleaned = name.strip()
+    for char in invalid_chars:
+        cleaned = cleaned.replace(char, "-")
+    
+    # Collapse multiple spaces to single space
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    
+    # Build folder name
+    folder_name = f"{sku}_{cleaned}"
+    
+    # Truncate if too long, but always keep full SKU
+    if len(folder_name) > max_len:
+        # Keep SKU + "_" + truncated name
+        available_for_name = max_len - len(sku) - 1  # -1 for underscore
+        if available_for_name > 0:
+            folder_name = f"{sku}_{cleaned[:available_for_name]}"
+        else:
+            # If SKU itself is too long, just return SKU (shouldn't happen normally)
+            folder_name = sku
+    
+    return folder_name
+
 def find_ref_image(directory: Path, sku: str, suffix: str) -> Optional[Path]:
     # looks for <SKU>_<suffix>.<ext>
     for ext in ALLOWED_EXTS:
@@ -262,6 +304,43 @@ def find_ref_image(directory: Path, sku: str, suffix: str) -> Optional[Path]:
         if p.exists():
             return p
     return None
+
+def find_ref_images(directory: Path, sku: str, suffix: str) -> List[Path]:
+    """
+    Find all reference images for a SKU+suffix.
+    Returns list where exact "{sku}_{suffix}.{ext}" is first if it exists,
+    then includes "{sku}_{suffix}_*.{ext}" sorted by name.
+    """
+    results: List[Path] = []
+    
+    # First, find the primary ref (exact match)
+    primary = find_ref_image(directory, sku, suffix)
+    if primary:
+        results.append(primary)
+    
+    # Then find all additional refs matching pattern {sku}_{suffix}_*.{ext}
+    if directory.exists():
+        pattern_base = f"{sku}_{suffix}_"
+        additional: List[Path] = []
+        
+        for file_path in directory.iterdir():
+            if not file_path.is_file():
+                continue
+            
+            name = file_path.name
+            name_lower = name.lower()
+            
+            # Check if it matches pattern and has allowed extension
+            if name.startswith(pattern_base) and any(name_lower.endswith(ext) for ext in ALLOWED_EXTS):
+                # Make sure it's not the primary (shouldn't happen, but be safe)
+                if file_path != primary:
+                    additional.append(file_path)
+        
+        # Sort additional refs by name
+        additional.sort(key=lambda p: p.name)
+        results.extend(additional)
+    
+    return results
 
 def detect_extension_from_url(url: str) -> str:
     # heuristic; we download as .png by default
@@ -483,33 +562,35 @@ class App:
             messagebox.showerror("Error", f"Cannot open folder: {e}")
 
     def apply_profile(self, profile: str):
-        """Apply profile preset to UI (width, height, steps, alchemy, model profile)."""
+        """Apply profile preset to UI (width, height, steps, alchemy, model profile, strengths)."""
         if profile == "CHEAP":
             self.width_var.set(768)
             self.height_var.set(768)
-            self.steps_var.set(10)
-            self.alchemy_var.set(False)
+            self.steps_var.set(30)
+            self.alchemy_var.set(True)
+            self.pack_strength_var.set(0.9)
+            self.piece_strength_var.set(0.9)
             if hasattr(self, 'hq_var'):
                 self.hq_var.set(False)
             self.profile_var.set("CHEAP")
-            # keep init strengths unchanged
+            self._log(f"Applied profile CHEAP: 768×768, steps=30, alchemy=ON, strength=0.9")
         elif profile == "HQ":
             self.width_var.set(1024)
             self.height_var.set(1024)
-            self.steps_var.set(15)
+            self.steps_var.set(30)
             self.alchemy_var.set(True)
+            self.pack_strength_var.set(0.9)
+            self.piece_strength_var.set(0.9)
             if hasattr(self, 'hq_var'):
                 self.hq_var.set(True)
             self.profile_var.set("HQ")
-            # keep init strengths unchanged
+            self._log(f"Applied profile HQ: 1024×1024, steps=30, alchemy=ON, strength=0.9")
 
     def apply_preset_cheap(self):
         self.apply_profile("CHEAP")
-        self._log("Applied preset CHEAP: Lightning XL, 768, steps=10, alchemy=OFF")
 
     def apply_preset_hq(self):
         self.apply_profile("HQ")
-        self._log("Applied preset HQ: Vision XL, 1024, steps=15, alchemy=ON")
 
     def _get_settings(self) -> Settings:
         return Settings(
@@ -527,7 +608,7 @@ class App:
             skip_existing=bool(self.skip_existing_var.get()),
             inference_steps=int(self.steps_var.get()),
             model_profile=self.profile_var.get(),
-            pack_num_images=2,
+            pack_num_images=1,
             piece_num_images=1,
             pack_prompt=self.pack_prompt.get().strip(),
             piece_prompt=self.piece_prompt.get().strip(),
@@ -576,19 +657,25 @@ class App:
 
             for r in rows:
                 sku = r["sku"]
-                pack = find_ref_image(s.pack_dir, sku, "pack")
-                piece = find_ref_image(s.piece_dir, sku, "piece")
+                pack_refs = find_ref_images(s.pack_dir, sku, "pack")
+                piece_refs = find_ref_images(s.piece_dir, sku, "piece")
 
                 will_do_any = False
 
-                if s.gen_pack and not pack:
-                    missing_pack += 1
-                    self._log(f"[MISSING PACK] {sku}")
-                if s.gen_piece and not piece:
-                    missing_piece += 1
-                    self._log(f"[MISSING PIECE] {sku}")
+                if s.gen_pack:
+                    if not pack_refs:
+                        missing_pack += 1
+                        self._log(f"[MISSING PACK] {sku}")
+                    else:
+                        self._log(f"[OK PACK] {sku} refs={len(pack_refs)}")
+                if s.gen_piece:
+                    if not piece_refs:
+                        missing_piece += 1
+                        self._log(f"[MISSING PIECE] {sku}")
+                    else:
+                        self._log(f"[OK PIECE] {sku} refs={len(piece_refs)}")
 
-                if (s.gen_pack and pack) or (s.gen_piece and piece):
+                if (s.gen_pack and pack_refs) or (s.gen_piece and piece_refs):
                     will_do_any = True
 
                 if will_do_any:
@@ -640,28 +727,26 @@ class App:
 
             rows = read_skus(s.csv_path)
 
-            # Prepare output + manifest
+            # Prepare output directory
             s.output_dir.mkdir(parents=True, exist_ok=True)
-            manifest_path = s.output_dir / "manifest.csv"
-            ensure_manifest(manifest_path)
 
             # Pre-compute total work units (for accurate progress)
             planned = 0
             for r in rows:
                 sku = r["sku"]
-                pack_ref = find_ref_image(s.pack_dir, sku, "pack")
-                piece_ref = find_ref_image(s.piece_dir, sku, "piece")
+                name = r.get("name", "")
+                folder_name = safe_folder_name(sku, name)
+                pack_refs = find_ref_images(s.pack_dir, sku, "pack")
+                piece_refs = find_ref_images(s.piece_dir, sku, "piece")
 
-                out_sku_dir = s.output_dir / sku
-                out_pack1 = out_sku_dir / f"{sku}__pack.png"
-                out_pack2 = out_sku_dir / f"{sku}__pack_02.png"
+                out_sku_dir = s.output_dir / folder_name
+                out_pack = out_sku_dir / f"{sku}__pack.png"
                 out_piece = out_sku_dir / f"{sku}__piece.png"
 
-                if s.gen_pack and pack_ref:
-                    pack_both_exist = s.skip_existing and out_pack1.exists() and out_pack2.exists()
-                    if not pack_both_exist:
+                if s.gen_pack and pack_refs:
+                    if not (s.skip_existing and out_pack.exists()):
                         planned += 1
-                if s.gen_piece and piece_ref:
+                if s.gen_piece and piece_refs:
                     if not (s.skip_existing and out_piece.exists()):
                         planned += 1
 
@@ -684,19 +769,23 @@ class App:
 
                 sku = r["sku"]
                 name = r.get("name", "")
+                folder_name = safe_folder_name(sku, name)
 
-                pack_ref = find_ref_image(s.pack_dir, sku, "pack")
-                piece_ref = find_ref_image(s.piece_dir, sku, "piece")
+                pack_refs = find_ref_images(s.pack_dir, sku, "pack")
+                piece_refs = find_ref_images(s.piece_dir, sku, "piece")
 
-                out_sku_dir = s.output_dir / sku
+                out_sku_dir = s.output_dir / folder_name
                 out_sku_dir.mkdir(parents=True, exist_ok=True)
 
-                out_pack1 = out_sku_dir / f"{sku}__pack.png"
-                out_pack2 = out_sku_dir / f"{sku}__pack_02.png"
+                # Per-SKU manifest
+                manifest_path = out_sku_dir / "manifest.csv"
+                ensure_manifest(manifest_path)
+
+                out_pack = out_sku_dir / f"{sku}__pack.png"
                 out_piece = out_sku_dir / f"{sku}__piece.png"
 
                 # If neither selected ref exists, skip SKU
-                has_any = (s.gen_pack and pack_ref) or (s.gen_piece and piece_ref)
+                has_any = (s.gen_pack and pack_refs) or (s.gen_piece and piece_refs)
                 if not has_any:
                     self._log(f"[SKIP] {sku} no usable refs for selected modes.")
                     continue
@@ -706,15 +795,22 @@ class App:
                 self._log(f"Profile={s.model_profile} modelId={current_model} | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy}")
 
                 # --- PACK (optional) ---
-                if s.gen_pack and pack_ref:
-                    # Check if both pack files exist for skip logic
-                    pack_both_exist = s.skip_existing and out_pack1.exists() and out_pack2.exists()
-                    if not pack_both_exist:
-                        self.status_var.set(f"{sku}: uploading pack ref…")
-                        self._log(f"[{sku}] Upload pack ref: {pack_ref.name}")
-                        pack_init_id = client.upload_init_image(pack_ref)
+                if s.gen_pack and pack_refs:
+                    if not (s.skip_existing and out_pack.exists()):
+                        # Upload all pack refs
+                        self.status_var.set(f"{sku}: uploading pack refs…")
+                        pack_ref_ids = []
+                        for ref_file in pack_refs:
+                            self._log(f"[{sku}] Upload pack ref: {ref_file.name}")
+                            ref_id = client.upload_init_image(ref_file)
+                            pack_ref_ids.append(ref_id)
+                        
+                        # Use first as init_image_id, rest as imagePrompts
+                        pack_init_id = pack_ref_ids[0]
+                        image_prompt_ids = pack_ref_ids[1:] if len(pack_ref_ids) > 1 else None
 
                         self.status_var.set(f"{sku}: generating PACK…")
+                        # Try with imagePrompts first
                         gen_id, cost = client.create_generation(
                             prompt=s.pack_prompt,
                             negative_prompt=s.negative_prompt,
@@ -726,41 +822,37 @@ class App:
                             num_images=s.pack_num_images,
                             inference_steps=s.inference_steps,
                             model_profile=s.model_profile,
+                            image_prompt_ids=image_prompt_ids,
                         )
+                        
+                        # If imagePrompts caused 400, retry without it
+                        if gen_id is None:
+                            self._log(f"[{sku}] PACK imagePrompts failed, retrying without imagePrompts...")
+                            gen_id, cost = client.create_generation(
+                                prompt=s.pack_prompt,
+                                negative_prompt=s.negative_prompt,
+                                width=s.width,
+                                height=s.height,
+                                init_image_id=pack_init_id,
+                                init_strength=s.pack_strength,
+                                alchemy=s.alchemy,
+                                num_images=s.pack_num_images,
+                                inference_steps=s.inference_steps,
+                                model_profile=s.model_profile,
+                                image_prompt_ids=None,
+                            )
+                        
                         self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
 
                         urls = client.wait_for_urls(gen_id, poll_s=s.poll_s, timeout_s=s.timeout_s)
-                        
-                        # Save multiple pack images
-                        saved_files = []
-                        for idx, url in enumerate(urls):
-                            if idx == 0:
-                                out_file = out_pack1
-                                variant = "pack"
-                            elif idx == 1:
-                                out_file = out_pack2
-                                variant = "pack_02"
-                            else:
-                                # Handle more than 2 images if needed
-                                out_file = out_sku_dir / f"{sku}__pack_{idx+1:02d}.png"
-                                variant = f"pack_{idx+1:02d}"
-                            
-                            if s.skip_existing and out_file.exists():
-                                self._log(f"[{sku}] {out_file.name} exists, skipping.")
-                            else:
-                                client.download(url, out_file)
-                                append_manifest(manifest_path, [sku, name, variant, gen_id, cost, str(out_file)])
-                                saved_files.append(out_file.name)
-                        
-                        if saved_files:
-                            self._log(f"[{sku}] Saved PACK -> {', '.join(saved_files)}")
-                        else:
-                            self._log(f"[{sku}] PACK all files exist, skipped.")
+                        client.download(urls[0], out_pack)
+                        append_manifest(manifest_path, [sku, name, "pack", gen_id, cost, str(out_pack)])
+                        self._log(f"[{sku}] Saved PACK -> {out_pack.name}")
 
                         done += 1
                         self.progress_var.set(done / planned * 100.0)
                     else:
-                        self._log(f"[{sku}] PACK exists (both files), skipping.")
+                        self._log(f"[{sku}] PACK exists, skipping.")
 
                 if self.stop_event.is_set():
                     self._log("Stopped by user.")
@@ -768,13 +860,22 @@ class App:
                     return
 
                 # --- PIECE (optional) ---
-                if s.gen_piece and piece_ref:
+                if s.gen_piece and piece_refs:
                     if not (s.skip_existing and out_piece.exists()):
-                        self.status_var.set(f"{sku}: uploading piece ref…")
-                        self._log(f"[{sku}] Upload piece ref: {piece_ref.name}")
-                        piece_init_id = client.upload_init_image(piece_ref)
+                        # Upload all piece refs
+                        self.status_var.set(f"{sku}: uploading piece refs…")
+                        piece_ref_ids = []
+                        for ref_file in piece_refs:
+                            self._log(f"[{sku}] Upload piece ref: {ref_file.name}")
+                            ref_id = client.upload_init_image(ref_file)
+                            piece_ref_ids.append(ref_id)
+                        
+                        # Use first as init_image_id, rest as imagePrompts
+                        piece_init_id = piece_ref_ids[0]
+                        image_prompt_ids = piece_ref_ids[1:] if len(piece_ref_ids) > 1 else None
 
                         self.status_var.set(f"{sku}: generating PIECE…")
+                        # Try with imagePrompts first
                         gen_id2, cost2 = client.create_generation(
                             prompt=s.piece_prompt,
                             negative_prompt=s.negative_prompt,
@@ -786,7 +887,26 @@ class App:
                             num_images=s.piece_num_images,
                             inference_steps=s.inference_steps,
                             model_profile=s.model_profile,
+                            image_prompt_ids=image_prompt_ids,
                         )
+                        
+                        # If imagePrompts caused 400, retry without it
+                        if gen_id2 is None:
+                            self._log(f"[{sku}] PIECE imagePrompts failed, retrying without imagePrompts...")
+                            gen_id2, cost2 = client.create_generation(
+                                prompt=s.piece_prompt,
+                                negative_prompt=s.negative_prompt,
+                                width=s.width,
+                                height=s.height,
+                                init_image_id=piece_init_id,
+                                init_strength=s.piece_strength,
+                                alchemy=s.alchemy,
+                                num_images=s.piece_num_images,
+                                inference_steps=s.inference_steps,
+                                model_profile=s.model_profile,
+                                image_prompt_ids=None,
+                            )
+                        
                         self._log(f"[{sku}] PIECE gen_id={gen_id2} cost={cost2}")
 
                         urls2 = client.wait_for_urls(gen_id2, poll_s=s.poll_s, timeout_s=s.timeout_s)
