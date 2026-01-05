@@ -21,6 +21,10 @@ BASE_URL = "https://cloud.leonardo.ai/api/rest/v1"  # official base
 ENV_PATH = Path(__file__).with_name(".env")
 load_dotenv(dotenv_path=ENV_PATH, override=False)
 
+# Model IDs (hardcoded for runtime switching)
+MODEL_CHEAP = "b24e16ff-06e3-43eb-8d33-4416c2d75876"  # Lightning XL
+MODEL_HQ = "5c232a9e-9061-4777-980a-ddc8e65647c6"  # Vision XL
+
 def get_model_id() -> str:
     """
     Read modelId from env dynamically (prevents 'env loaded too late' issues).
@@ -79,7 +83,7 @@ class Settings:
     alchemy: bool = True
     skip_existing: bool = True
     inference_steps: int = 12
-    use_hq_model: bool = False
+    model_profile: str = "CHEAP"  # CHEAP | HQ
     # note: resolution controlled by width/height
     poll_s: float = 2.0
     timeout_s: int = 240
@@ -154,9 +158,9 @@ class LeonardoClient:
         alchemy: bool,
         num_images: int = 1,
         inference_steps: int = 12,
-        use_hq_model: bool = False,
+        model_profile: str = "CHEAP",
     ) -> Tuple[str, Optional[int]]:
-        model_id = get_hq_model_id() if use_hq_model else get_model_id()
+        model_id = MODEL_HQ if model_profile == "HQ" else MODEL_CHEAP
         payload: Dict[str, Any] = {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
@@ -322,6 +326,7 @@ class App:
         self.skip_existing_var = tk.BooleanVar(value=True)
         self.steps_var = tk.IntVar(value=12)
         self.hq_var = tk.BooleanVar(value=False)
+        self.profile_var = tk.StringVar(value="CHEAP")
 
         self.gen_pack_var = tk.BooleanVar(value=True)
         self.gen_piece_var = tk.BooleanVar(value=True)
@@ -383,7 +388,9 @@ class App:
         ttk.Checkbutton(row1, text="Alchemy", variable=self.alchemy_var).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(row1, text="Skip existing outputs", variable=self.skip_existing_var).pack(side="left")
 
-        ttk.Label(row1, text="Steps").pack(side="left", padx=(16, 0))
+        ttk.Label(row1, text="Profile").pack(side="left", padx=(16, 0))
+        ttk.Combobox(row1, textvariable=self.profile_var, values=["CHEAP", "HQ"], width=6, state="readonly").pack(side="left", padx=(6, 16))
+        ttk.Label(row1, text="Steps").pack(side="left", padx=(0, 0))
         ttk.Entry(row1, textvariable=self.steps_var, width=6).pack(side="left", padx=(6, 16))
 
         ttk.Checkbutton(row1, text="HQ model", variable=self.hq_var).pack(side="left", padx=(0, 12))
@@ -474,6 +481,7 @@ class App:
         self.steps_var.set(12)
         self.alchemy_var.set(False)
         self.hq_var.set(False)
+        self.profile_var.set("CHEAP")
         # keep init strengths conservative for fidelity
         self.pack_strength_var.set(0.22)
         self.piece_strength_var.set(0.35)
@@ -485,6 +493,7 @@ class App:
         self.steps_var.set(15)
         self.alchemy_var.set(True)
         self.hq_var.set(True)
+        self.profile_var.set("HQ")
         self.pack_strength_var.set(0.22)
         self.piece_strength_var.set(0.35)
         self._log("Applied preset HQ: Vision XL, 1024, steps=15, alchemy=ON")
@@ -504,7 +513,7 @@ class App:
             alchemy=bool(self.alchemy_var.get()),
             skip_existing=bool(self.skip_existing_var.get()),
             inference_steps=int(self.steps_var.get()),
-            use_hq_model=bool(self.hq_var.get()),
+            model_profile=self.profile_var.get(),
             pack_prompt=self.pack_prompt.get().strip(),
             piece_prompt=self.piece_prompt.get().strip(),
             negative_prompt=self.negative_prompt.get().strip(),
@@ -648,7 +657,8 @@ class App:
 
             done = 0
             self._log(f"Batch start: {len(rows)} SKUs -> {planned} images planned.")
-            self._log(f"Mode: {'HQ' if s.use_hq_model else 'CHEAP'} | modelId: {get_hq_model_id() if s.use_hq_model else get_model_id()} | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy}")
+            current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
+            self._log(f"Profile={s.model_profile} modelId={current_model} | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy}")
 
             for r in rows:
                 if self.stop_event.is_set():
@@ -682,6 +692,7 @@ class App:
                         pack_init_id = client.upload_init_image(pack_ref)
 
                         self.status_var.set(f"{sku}: generating PACK…")
+                        self._log(f"Profile={s.model_profile} modelId={(MODEL_HQ if s.model_profile == 'HQ' else MODEL_CHEAP)}")
                         gen_id, cost = client.create_generation(
                             prompt=s.pack_prompt,
                             negative_prompt=s.negative_prompt,
@@ -692,7 +703,7 @@ class App:
                             alchemy=s.alchemy,
                             num_images=1,
                             inference_steps=s.inference_steps,
-                            use_hq_model=s.use_hq_model,
+                            model_profile=s.model_profile,
                         )
                         self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
 
@@ -719,6 +730,7 @@ class App:
                         piece_init_id = client.upload_init_image(piece_ref)
 
                         self.status_var.set(f"{sku}: generating PIECE…")
+                        self._log(f"Profile={s.model_profile} modelId={(MODEL_HQ if s.model_profile == 'HQ' else MODEL_CHEAP)}")
                         gen_id2, cost2 = client.create_generation(
                             prompt=s.piece_prompt,
                             negative_prompt=s.negative_prompt,
@@ -729,7 +741,7 @@ class App:
                             alchemy=s.alchemy,
                             num_images=1,
                             inference_steps=s.inference_steps,
-                            use_hq_model=s.use_hq_model,
+                            model_profile=s.model_profile,
                         )
                         self._log(f"[{sku}] PIECE gen_id={gen_id2} cost={cost2}")
 
