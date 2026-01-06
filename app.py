@@ -1013,8 +1013,25 @@ class App:
         log_frame = ttk.LabelFrame(self.root, text="Log", padding=pad)
         log_frame.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
 
-        self.log_box = tk.Text(log_frame, wrap="word", state="disabled")
-        self.log_box.pack(fill="both", expand=True)
+        # Container for text and scrollbar
+        log_container = ttk.Frame(log_frame)
+        log_container.pack(fill="both", expand=True)
+
+        # Scrollbar
+        log_scrollbar = ttk.Scrollbar(log_container, orient="vertical")
+        log_scrollbar.pack(side="right", fill="y")
+
+        # Text widget with scrollbar
+        self.log_box = tk.Text(log_container, wrap="word", state="disabled", yscrollcommand=log_scrollbar.set)
+        self.log_box.pack(side="left", fill="both", expand=True)
+        log_scrollbar.config(command=self.log_box.yview)
+
+        # Mousewheel scroll support (Windows)
+        def _on_mousewheel(event):
+            self.log_box.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+        
+        self.log_box.bind("<MouseWheel>", _on_mousewheel)
 
     def _row_path(self, parent, label: str, var: tk.StringVar, browse_cmd):
         row = ttk.Frame(parent)
@@ -1087,8 +1104,25 @@ class App:
             while True:
                 msg = self.log_q.get_nowait()
                 self.log_box.configure(state="normal")
+                
+                # Check if user is at bottom before inserting (smart auto-scroll)
+                # Get scroll position: yview returns (top, bottom) where values are 0.0 to 1.0
+                at_bottom = False
+                try:
+                    yview = self.log_box.yview()
+                    # If bottom of visible area is >= 0.99, user is at or near bottom
+                    if len(yview) >= 2 and yview[1] >= 0.99:
+                        at_bottom = True
+                except:
+                    # If we can't determine, default to auto-scroll (safer)
+                    at_bottom = True
+                
                 self.log_box.insert("end", msg + "\n")
-                self.log_box.see("end")
+                
+                # Only auto-scroll if user was already at bottom
+                if at_bottom:
+                    self.log_box.see("end")
+                
                 self.log_box.configure(state="disabled")
         except Empty:
             pass

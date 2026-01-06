@@ -1,9 +1,10 @@
 ; Inno Setup Script for LnardoTool
 ; Compile with Inno Setup Compiler (https://jrsoftware.org/isinfo.php)
 
-#define SourcePath GetFileDir(GetFileDir(SourceFile))
-#define MyAppVersion Trim(FileRead(SourcePath + "\VERSION.txt"))
-#define MyIconPath SourcePath + "\assets\app.ico"
+#define SourcePath ".."
+#define MyAppVersion "1.1.2"
+#define MyIconPath SourcePath + "/assets/app.ico"
+
 
 [Setup]
 AppName=LnardoTool
