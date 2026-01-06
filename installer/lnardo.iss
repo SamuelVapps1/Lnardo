@@ -1,16 +1,22 @@
 ; Inno Setup Script for LnardoTool
 ; Compile with Inno Setup Compiler (https://jrsoftware.org/isinfo.php)
 
+#define SourcePath GetFileDir(GetFileDir(SourceFile))
+#define MyAppVersion Trim(FileRead(SourcePath + "\VERSION.txt"))
+#define MyIconPath SourcePath + "\assets\app.ico"
+
 [Setup]
 AppName=LnardoTool
-AppVersion=1.0
+AppVersion={#MyAppVersion}
 DefaultDirName={localappdata}\LnardoTool
 DefaultGroupName=LnardoTool
-OutputDir=installer
+OutputDir={#SourcePath}
 OutputBaseFilename=LnardoTool-Setup
 Compression=lzma
 SolidCompression=yes
-SetupIconFile=..\assets\app.ico
+#if FileExists(MyIconPath)
+SetupIconFile={#MyIconPath}
+#endif
 UninstallDisplayIcon={app}\LnardoTool.exe
 PrivilegesRequired=lowest
 

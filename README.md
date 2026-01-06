@@ -39,10 +39,17 @@ Professional Windows desktop application for batch generating product photos usi
    ```
 
 2. **Prepare icon (optional):**
-   - Place `app.ico` in `assets/` folder
-   - If missing, PyInstaller will use default icon
+   - Icon is optional. If you want a custom icon, create `assets/app.ico` locally (not committed to repo).
+   - If icon is missing, PyInstaller will use default Python icon.
 
 3. **Build executable:**
+   
+   **Without icon:**
+   ```bash
+   pyinstaller --noconsole --onedir --name LnardoTool app.py
+   ```
+   
+   **With icon (if assets/app.ico exists):**
    ```bash
    pyinstaller --noconsole --onedir --name LnardoTool --icon assets/app.ico app.py
    ```
@@ -69,7 +76,7 @@ Documents\LnardoTool\
 │       ├── <SKU>__piece.png
 │       └── manifest.csv
 ├── skus.csv            # SKU list (sku, name columns)
-└── .env                # API key (created by wizard)
+└── .env                # API key (created by API Key Wizard, intentionally ignored by git)
 ```
 
 ## Usage
@@ -78,6 +85,8 @@ Documents\LnardoTool\
    - App creates workspace in `Documents\LnardoTool`
    - API Key Wizard prompts for Leonardo API key
    - Paste your key and optionally set Model ID
+   - **Note:** `.env` file is created locally in `Documents\LnardoTool\.env` by the API Key Wizard
+   - `.env` is intentionally ignored by git and must never be committed
 
 2. **Prepare References:**
    - Add pack images: `input/pack/<SKU>_pack.jpg`
