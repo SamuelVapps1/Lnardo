@@ -133,7 +133,7 @@ class Settings:
     piece_strength: float = 0.90
     alchemy: bool = True
     skip_existing: bool = True
-    inference_steps: int = 30
+    inference_steps: int = 12
     model_profile: str = "CHEAP"  # CHEAP | HQ
     pack_num_images: int = 1
     piece_num_images: int = 1
@@ -866,7 +866,7 @@ class App:
         self.piece_strength_var = tk.DoubleVar(value=0.90)
         self.alchemy_var = tk.BooleanVar(value=True)
         self.skip_existing_var = tk.BooleanVar(value=True)
-        self.steps_var = tk.IntVar(value=30)
+        self.steps_var = tk.IntVar(value=12)
         self.profile_var = tk.StringVar(value="CHEAP")
 
         self.gen_pack_var = tk.BooleanVar(value=True)
