@@ -3,6 +3,7 @@ import json
 import os
 import re
 import statistics
+import sys
 import threading
 import time
 from datetime import datetime
@@ -23,10 +24,45 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 BASE_URL = "https://cloud.leonardo.ai/api/rest/v1"  # official base
 
 # --- Workspace Setup ---
+def get_app_base_dir() -> Path:
+    """
+    Get the base directory where the app is located.
+    - If frozen (PyInstaller): returns directory of sys.executable
+    - Else: returns directory of app.py script
+    """
+    if getattr(sys, 'frozen', False):
+        # Running as compiled executable
+        base_dir = Path(sys.executable).parent
+    else:
+        # Running as script
+        base_dir = Path(__file__).parent
+    
+    return base_dir
+
 def get_workspace_dir() -> Path:
-    """Get workspace directory in Documents\LnardoTool"""
-    user_profile = os.getenv("USERPROFILE", os.path.expanduser("~"))
-    workspace = Path(user_profile) / "Documents" / "LnardoTool"
+    """
+    Get workspace directory next to the executable/app.
+    Workspace is created in <app_dir>/workspace/
+    """
+    base_dir = get_app_base_dir()
+    workspace = base_dir / "workspace"
+    
+    # Fallback: if base_dir is not writable, use per-user directory
+    try:
+        # Test if we can write to base_dir
+        test_file = base_dir / ".write_test"
+        try:
+            test_file.touch()
+            test_file.unlink()
+        except (PermissionError, OSError):
+            # Not writable, fall back to per-user directory
+            user_profile = os.getenv("USERPROFILE", os.path.expanduser("~"))
+            workspace = Path(user_profile) / "Documents" / "LnardoTool"
+    except Exception:
+        # If anything fails, use per-user directory as safe fallback
+        user_profile = os.getenv("USERPROFILE", os.path.expanduser("~"))
+        workspace = Path(user_profile) / "Documents" / "LnardoTool"
+    
     return workspace
 
 def ensure_workspace() -> Path:
@@ -892,7 +928,53 @@ class App:
     def _build_ui(self):
         pad = 12
 
-        header = ttk.Frame(self.root, padding=pad)
+        # Create scrollable container for entire UI
+        # Main container: Canvas + Scrollbar
+        main_container = ttk.Frame(self.root)
+        main_container.pack(fill="both", expand=True)
+        
+        # Canvas for scrolling
+        canvas = tk.Canvas(main_container, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main_container, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        # Configure scrollbar
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        # Create window on canvas for scrollable frame
+        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        
+        # Configure canvas scrolling
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack canvas and scrollbar
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Bind mouse wheel to canvas (Windows)
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        # Also bind to scrollable_frame so scrolling works when mouse is over any widget
+        scrollable_frame.bind("<MouseWheel>", _on_mousewheel)
+        
+        # Update canvas width when window resizes
+        def _on_canvas_configure(event):
+            canvas_width = event.width
+            canvas.itemconfig(canvas_window, width=canvas_width)
+        
+        canvas.bind("<Configure>", _on_canvas_configure)
+        
+        # Store canvas reference for potential future use
+        self.main_canvas = canvas
+        self.scrollable_frame = scrollable_frame
+        
+        # Now build UI inside scrollable_frame instead of self.root
+        header = ttk.Frame(scrollable_frame, padding=pad)
         header.pack(fill="x")
 
         ttk.Label(header, text="Laurapets – Leonardo Batch Generator", font=("Segoe UI", 16, "bold")).pack(anchor="w")
@@ -903,7 +985,7 @@ class App:
         ).pack(anchor="w", pady=(4, 0))
 
         # Actions
-        actions = ttk.Frame(self.root, padding=pad)
+        actions = ttk.Frame(scrollable_frame, padding=pad)
         actions.pack(fill="x")
 
         ttk.Button(actions, text="Test API Key (GET /me)", command=self.on_test_api).pack(side="left")
@@ -915,7 +997,7 @@ class App:
         ttk.Button(actions, text="Open Workspace Folder", command=self.on_open_workspace).pack(side="left", padx=(8, 0))
 
         # Paths
-        paths = ttk.LabelFrame(self.root, text="Paths", padding=pad)
+        paths = ttk.LabelFrame(scrollable_frame, text="Paths", padding=pad)
         paths.pack(fill="x", padx=pad, pady=(0, pad))
 
         self._row_path(paths, "CSV (skus.csv):", self.csv_var, self.browse_csv)
@@ -924,7 +1006,7 @@ class App:
         self._row_path(paths, "Output dir:", self.output_dir_var, lambda: self.browse_dir(self.output_dir_var))
 
         # Settings
-        settings = ttk.LabelFrame(self.root, text="Generation Settings", padding=pad)
+        settings = ttk.LabelFrame(scrollable_frame, text="Generation Settings", padding=pad)
         settings.pack(fill="x", padx=pad, pady=(0, pad))
 
         row1 = ttk.Frame(settings)
@@ -984,7 +1066,7 @@ class App:
         self.lockable_widgets.extend([pack_strength_entry, piece_strength_entry, reject_watermarks_cb, studio_mode_cb, normalize_framing_cb, enhance_refs_cb])
 
         # Prompts
-        prompts = ttk.LabelFrame(self.root, text="Prompts", padding=pad)
+        prompts = ttk.LabelFrame(scrollable_frame, text="Prompts", padding=pad)
         prompts.pack(fill="both", expand=False, padx=pad, pady=(0, pad))
 
         ttk.Label(prompts, text="Pack prompt:").pack(anchor="w")
@@ -1003,26 +1085,29 @@ class App:
         self.lockable_widgets.extend([pack_prompt_entry, piece_prompt_entry, negative_prompt_entry])
 
         # Progress + status
-        prog = ttk.Frame(self.root, padding=(pad, 0, pad, pad))
+        prog = ttk.Frame(scrollable_frame, padding=(pad, 0, pad, pad))
         prog.pack(fill="x")
 
         ttk.Label(prog, textvariable=self.status_var).pack(anchor="w")
         ttk.Progressbar(prog, variable=self.progress_var, maximum=100.0).pack(fill="x", pady=(6, 0))
 
-        # Log
-        log_frame = ttk.LabelFrame(self.root, text="Log", padding=pad)
-        log_frame.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
+        # Log (fixed height, scrollable within its frame)
+        log_frame = ttk.LabelFrame(scrollable_frame, text="Log", padding=pad)
+        log_frame.pack(fill="x", padx=pad, pady=(0, pad))
 
         # Container for text and scrollbar (using grid for reliable scrollbar visibility)
         log_container = ttk.Frame(log_frame)
         log_container.pack(fill="both", expand=True)
+        
+        # Set fixed height for log (200 pixels)
+        log_container.configure(height=200)
         
         # Configure grid weights so content expands
         log_container.rowconfigure(0, weight=1)
         log_container.columnconfigure(0, weight=1)
 
         # Text widget
-        self.log_box = tk.Text(log_container, wrap="word", state="disabled")
+        self.log_box = tk.Text(log_container, wrap="word", state="disabled", height=10)
         self.log_box.grid(row=0, column=0, sticky="nsew")
 
         # Scrollbar
@@ -1032,12 +1117,20 @@ class App:
         # Connect scrollbar to text widget
         self.log_box.configure(yscrollcommand=log_scrollbar.set)
 
-        # Mousewheel scroll support (Windows)
-        def _on_mousewheel(event):
+        # Mousewheel scroll support (Windows) - for log widget
+        def _on_log_mousewheel(event):
             self.log_box.yview_scroll(int(-1 * (event.delta / 120)), "units")
             return "break"
         
-        self.log_box.bind("<MouseWheel>", _on_mousewheel)
+        self.log_box.bind("<MouseWheel>", _on_log_mousewheel)
+        
+        # Update main canvas scrollregion after UI is built
+        def _update_scrollregion():
+            canvas.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        
+        # Schedule scrollregion update after UI is fully built
+        self.root.after(100, _update_scrollregion)
 
     def _row_path(self, parent, label: str, var: tk.StringVar, browse_cmd):
         row = ttk.Frame(parent)

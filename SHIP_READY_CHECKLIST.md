@@ -40,9 +40,10 @@ pyinstaller --noconsole --onedir --name LnardoTool --icon assets/app.ico app.py
 1. Run `dist\LnardoTool\LnardoTool.exe`
 2. Verify:
    - ✅ App launches without crash
-   - ✅ Workspace created in `Documents\LnardoTool`
+   - ✅ Workspace created in `dist\LnardoTool\workspace\`
    - ✅ API Key Wizard appears if .env missing
    - ✅ Profile switching works (CHEAP/HQ)
+   - ✅ UI scrolls properly (mouse wheel works, scrollbar visible)
    - ✅ UI locks during generation
    - ✅ Generation works end-to-end
 
@@ -56,6 +57,7 @@ pyinstaller --noconsole --onedir --name LnardoTool --icon assets/app.ico app.py
    - Open `installer/lnardo.iss` in Inno Setup
    - Build → Compile
    - Output: `installer/LnardoTool-Setup.exe`
+   - **IMPORTANT**: Do NOT commit `installer/LnardoTool-Setup.exe` to git (it's in .gitignore)
 
 ### Step 4: Copy to USB
 
@@ -71,7 +73,7 @@ pyinstaller --noconsole --onedir --name LnardoTool --icon assets/app.ico app.py
 3. Follow installer (defaults are fine)
 4. Launch from Desktop shortcut
 5. On first run:
-   - Workspace auto-created in `Documents\LnardoTool`
+   - Workspace auto-created in `<install_dir>\workspace\` (typically `%LOCALAPPDATA%\LnardoTool\workspace\`)
    - API Key Wizard prompts for key
    - Paste Leonardo API key
    - App ready to use
@@ -81,8 +83,9 @@ pyinstaller --noconsole --onedir --name LnardoTool --icon assets/app.ico app.py
 After installation on Simona's notebook:
 
 - [ ] App launches without console window
-- [ ] Workspace created in `Documents\LnardoTool`
+- [ ] Workspace created in `<install_dir>\workspace\` (not Documents)
 - [ ] API Key Wizard works on first run
+- [ ] UI scrolls properly (mouse wheel works, scrollbar visible)
 - [ ] Profile switching updates UI correctly
 - [ ] UI locks during generation
 - [ ] Generation completes successfully
@@ -93,25 +96,26 @@ After installation on Simona's notebook:
 ## File Structure on Simona's Notebook
 
 ```
-C:\Program Files\LnardoTool\
-└── [app files from installer]
-
-C:\Users\Simona\Documents\LnardoTool\
-├── input\
-│   ├── pack\
-│   └── piece\
-├── output\
-│   └── run_YYYYMMDD_HHMMSS.log
-├── skus.csv
-└── .env
+C:\Users\Simona\AppData\Local\LnardoTool\
+├── LnardoTool.exe
+├── [app files from installer]
+└── workspace\
+    ├── input\
+    │   ├── pack\
+    │   └── piece\
+    ├── output\
+    │   └── run_YYYYMMDD_HHMMSS.log
+    ├── skus.csv
+    └── .env
 ```
 
 ## Notes
 
 - App is fully self-contained after installation
-- All work happens in `Documents\LnardoTool` (not Program Files)
-- API key stored securely in workspace `.env`
+- All work happens in `<install_dir>\workspace\` (not Program Files, not Documents)
+- API key stored securely in `workspace/.env` (never committed to git)
 - No console window (professional appearance)
+- Entire UI is scrollable with mouse wheel support (Windows)
 - Thread-safe UI updates prevent random crashes
 - Continue-on-error ensures batch completes even with failures
 

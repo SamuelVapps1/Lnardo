@@ -48,3 +48,14 @@ temp/
 build/
 dist/
 *.spec
+
+# --- Installer binaries ---
+*.exe
+*.msi
+*.zip
+*.7z
+installer/*.exe
+
+# --- Workspace files (never commit) ---
+**/.env
+workspace/

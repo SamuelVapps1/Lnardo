@@ -4,7 +4,7 @@ Professional Windows desktop application for batch generating product photos usi
 
 ## Features
 
-- **Workspace Mode**: All work is done in `Documents\LnardoTool` folder
+- **Workspace Mode**: All work is done in `workspace/` folder next to the executable
 - **Blur-to-Sharp Pipeline**: Automatically enhances blurry reference images
 - **Watermark Detection**: Rejects reference images with watermarks/text overlays
 - **Studio Photo Mode**: Generates realistic studio product photos
@@ -20,7 +20,7 @@ Professional Windows desktop application for batch generating product photos usi
 2. Run the installer
 3. Launch from Desktop shortcut or Start Menu
 4. On first run, the app will:
-   - Create workspace in `Documents\LnardoTool`
+   - Create workspace in `<install_dir>\workspace\`
    - Prompt for Leonardo API key
 
 ### Option 2: Build from Source
@@ -49,35 +49,42 @@ Professional Windows desktop application for batch generating product photos usi
 
 4. **Test the build:**
    - Run `dist\LnardoTool\LnardoTool.exe`
-   - Verify workspace is created in `Documents\LnardoTool`
+   - Verify workspace is created in `dist\LnardoTool\workspace\`
 
 5. **Create installer (optional):**
    - Open `installer/lnardo.iss` in Inno Setup Compiler
    - Build → Compile
-   - Installer will be in `installer/` folder
+   - Installer will be in `installer/` folder as `LnardoTool-Setup.exe`
+   - **IMPORTANT**: Do NOT commit the installer exe to git (it's in .gitignore)
 
 ## Workspace Structure
 
+The workspace is created next to the executable (or in the install directory):
+
 ```
-Documents\LnardoTool\
-├── input\
-│   ├── pack\          # Pack reference images: <SKU>_pack.jpg
-│   └── piece\          # Piece reference images: <SKU>_piece.jpg
-├── output\             # Generated images
-│   └── <SKU>__<name>\  # Per-SKU folders
+<app_dir>/workspace/
+├── input/
+│   ├── pack/          # Pack reference images: <SKU>_pack.jpg
+│   └── piece/         # Piece reference images: <SKU>_piece.jpg
+├── output/            # Generated images
+│   └── <SKU>__<name>/ # Per-SKU folders
 │       ├── <SKU>__pack.png
 │       ├── <SKU>__piece.png
 │       └── manifest.csv
-├── skus.csv            # SKU list (sku, name columns)
-└── .env                # API key (created by wizard)
+├── skus.csv           # SKU list (sku, name columns)
+└── .env               # API key (created by wizard, never committed)
 ```
+
+**Note**: When running from PyInstaller `dist/`, workspace is at `dist/LnardoTool/workspace/`.
+When installed via installer, workspace is at `<install_dir>/workspace/` (typically `%LOCALAPPDATA%\LnardoTool\workspace\`).
 
 ## Usage
 
 1. **First Run:**
-   - App creates workspace in `Documents\LnardoTool`
+   - App creates workspace next to executable in `workspace/` folder
    - API Key Wizard prompts for Leonardo API key
    - Paste your key and optionally set Model ID
+   - API key is saved to `workspace/.env` (never committed to git)
 
 2. **Prepare References:**
    - Add pack images: `input/pack/<SKU>_pack.jpg`
@@ -102,10 +109,11 @@ Documents\LnardoTool\
 
 ## Troubleshooting
 
-- **API Key Missing**: Run app and use the API Key Wizard
-- **Missing References**: Check `input/pack/` and `input/piece/` folders
+- **API Key Missing**: Run app and use the API Key Wizard (saves to `workspace/.env`)
+- **Missing References**: Check `workspace/input/pack/` and `workspace/input/piece/` folders
 - **Generation Fails**: Check log for error messages, verify API key is valid
-- **Workspace Not Found**: App creates it automatically on first run
+- **Workspace Not Found**: App creates it automatically on first run next to executable
+- **Can't Scroll UI**: Use mouse wheel or scrollbar on the right side of the window
 
 ## Requirements
 

@@ -14,14 +14,16 @@ pyinstaller --noconsole --onedir --name LnardoTool --icon assets/app.ico app.py
 1. Open `installer/lnardo.iss` in Inno Setup Compiler
 2. Build → Compile
 3. Installer will be in `installer/` folder as `LnardoTool-Setup.exe`
+4. **IMPORTANT**: Do NOT commit `installer/LnardoTool-Setup.exe` to git (it's in .gitignore)
 
 ## Quick Sanity Tests
 
 ### Test 1: First Run
 - [ ] Launch `dist\LnardoTool\LnardoTool.exe`
-- [ ] Verify workspace created in `Documents\LnardoTool`
+- [ ] Verify workspace created in `dist\LnardoTool\workspace\`
 - [ ] Verify API Key Wizard appears if .env missing
-- [ ] Enter API key and verify it saves to workspace\.env
+- [ ] Enter API key and verify it saves to `workspace\.env`
+- [ ] Verify UI is scrollable (mouse wheel works, scrollbar visible on right)
 
 ### Test 2: Profile Switching
 - [ ] Select "CHEAP" profile from dropdown

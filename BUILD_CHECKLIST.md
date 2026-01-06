@@ -25,9 +25,10 @@ pyinstaller --noconsole --onedir --name LnardoTool --icon assets/app.ico app.py
 
 1. Run `dist\LnardoTool\LnardoTool.exe`
 2. Verify:
-   - ✅ Workspace created in `Documents\LnardoTool`
+   - ✅ Workspace created in `dist\LnardoTool\workspace\`
    - ✅ API Key Wizard appears if .env missing
    - ✅ Profile dropdown changes settings (CHEAP/HQ)
+   - ✅ UI scrolls properly (mouse wheel works, scrollbar visible)
    - ✅ UI locks during generation
    - ✅ Generation works and creates per-SKU manifest
 
@@ -41,6 +42,7 @@ pyinstaller --noconsole --onedir --name LnardoTool --icon assets/app.ico app.py
    - Open `installer/lnardo.iss` in Inno Setup
    - Build → Compile
    - Installer will be in `installer/` folder as `LnardoTool-Setup.exe`
+   - **IMPORTANT**: Do NOT commit `installer/LnardoTool-Setup.exe` to git (it's in .gitignore)
 
 3. **Test installer:**
    - Run installer on clean system (or VM)
@@ -71,6 +73,8 @@ dist/LnardoTool/
 ## Notes
 
 - App runs without console window (--noconsole flag)
-- Workspace is always in `Documents\LnardoTool` regardless of install path
-- API key is stored in workspace `.env` file
+- Workspace is created next to executable in `workspace/` folder
+- When installed, workspace is at `<install_dir>/workspace/` (typically `%LOCALAPPDATA%\LnardoTool\workspace\`)
+- API key is stored in `workspace/.env` file (never committed to git)
 - Each SKU gets its own folder with manifest.csv
+- Entire UI is scrollable with mouse wheel support (Windows)
