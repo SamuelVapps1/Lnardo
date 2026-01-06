@@ -1013,18 +1013,24 @@ class App:
         log_frame = ttk.LabelFrame(self.root, text="Log", padding=pad)
         log_frame.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
 
-        # Container for text and scrollbar
+        # Container for text and scrollbar (using grid for reliable scrollbar visibility)
         log_container = ttk.Frame(log_frame)
         log_container.pack(fill="both", expand=True)
+        
+        # Configure grid weights so content expands
+        log_container.rowconfigure(0, weight=1)
+        log_container.columnconfigure(0, weight=1)
+
+        # Text widget
+        self.log_box = tk.Text(log_container, wrap="word", state="disabled")
+        self.log_box.grid(row=0, column=0, sticky="nsew")
 
         # Scrollbar
-        log_scrollbar = ttk.Scrollbar(log_container, orient="vertical")
-        log_scrollbar.pack(side="right", fill="y")
-
-        # Text widget with scrollbar
-        self.log_box = tk.Text(log_container, wrap="word", state="disabled", yscrollcommand=log_scrollbar.set)
-        self.log_box.pack(side="left", fill="both", expand=True)
-        log_scrollbar.config(command=self.log_box.yview)
+        log_scrollbar = ttk.Scrollbar(log_container, orient="vertical", command=self.log_box.yview)
+        log_scrollbar.grid(row=0, column=1, sticky="ns")
+        
+        # Connect scrollbar to text widget
+        self.log_box.configure(yscrollcommand=log_scrollbar.set)
 
         # Mousewheel scroll support (Windows)
         def _on_mousewheel(event):
