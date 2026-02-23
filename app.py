@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import statistics
 import sys
 import threading
@@ -183,6 +184,8 @@ class Settings:
     studio_mode: bool = True  # Studio Photo Mode
     normalize_framing: bool = False  # Optional postprocess for consistent framing
     enhance_refs: bool = True  # Enhance blurry refs (denoise+upscale+sharpen)
+    text_fidelity_mode: bool = True  # Lock init_strength (don't auto-lower on blur)
+    disable_autocrop_pack: bool = True  # Skip autocrop for pack refs (preserve label margins)
 
 # Retry logic for transient API errors
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -603,11 +606,13 @@ def preprocess_ref_image(
     out_path: Path,
     target_w: int,
     target_h: int,
-    enhance: bool = True
+    enhance: bool = True,
+    skip_autocrop: bool = False
 ) -> Tuple[Path, float]:
     """
     Preprocess reference image: auto-crop, resize, enhance, and compute sharpness.
     Returns (out_path, sharpness_score).
+    skip_autocrop: if True, skip autocrop step (preserves label margins)
     """
     try:
         # Load image
@@ -621,8 +626,14 @@ def preprocess_ref_image(
         elif img.mode != 'RGB':
             img = img.convert('RGB')
         
-        # Auto-crop to remove huge white margins
-        img = autocrop_nonwhite(img)
+        # Auto-crop to remove huge white margins (unless disabled)
+        if not skip_autocrop:
+            img = autocrop_nonwhite(img)
+        else:
+            # When autocrop is disabled for pack, use increased padding to avoid cropping near-white edges
+            # This is handled by using pad_ratio=0.18 in autocrop_nonwhite if we were to call it,
+            # but since we skip it, we just proceed with the original image
+            pass
         
         # Resize to fit inside target dimensions while keeping aspect ratio
         img_w, img_h = img.size
@@ -676,15 +687,29 @@ def build_strict_prompt(kind: str, base_prompt: str, name: str, studio_mode: boo
     studio_mode: if True, wrap with strict studio photo constraints
     """
     if studio_mode:
-        constraints = [
-            "real product photo, studio product photography, DSLR",
-            "pure white seamless background",
-            "single product only",
-            "natural soft shadow under product",
-            "centered, sharp focus",
-            "do not add any text, logos, labels, props, plates, bowls, hands",
-            "match the reference image shape, material, texture and color"
-        ]
+        if kind == "pack":
+            # For pack: preserve original text, don't forbid it
+            constraints = [
+                "real product photo, studio product photography, DSLR",
+                "pure white seamless background",
+                "single product only",
+                "natural soft shadow under product",
+                "centered, sharp focus",
+                "do not add any NEW text, logos, labels, props, plates, bowls, hands",
+                "preserve the ORIGINAL label text and packaging design exactly as in the reference",
+                "match the reference image shape, material, texture and color"
+            ]
+        else:  # piece
+            # For piece: keep "no text" constraint
+            constraints = [
+                "real product photo, studio product photography, DSLR",
+                "pure white seamless background",
+                "single product only",
+                "natural soft shadow under product",
+                "centered, sharp focus",
+                "do not add any text, logos, labels, props, plates, bowls, hands",
+                "match the reference image shape, material, texture and color"
+            ]
         constraint_text = ", ".join(constraints)
         
         if name:
@@ -714,6 +739,12 @@ def build_strict_negative(user_negative: str, variant: str = "pack", studio_mode
     else:  # piece
         base_negative = DEFAULT_PIECE_NEGATIVE
     
+    # Text warping negative tokens (important for text fidelity)
+    text_fidelity_negatives = (
+        "distorted text, illegible letters, warped typography, incorrect spelling, "
+        "broken fonts, unreadable text, text deformation, garbled text"
+    )
+    
     if studio_mode:
         # Strong negative tokens for studio photo mode
         studio_negatives = (
@@ -723,15 +754,15 @@ def build_strict_negative(user_negative: str, variant: str = "pack", studio_mode
         )
         
         if user_tokens:
-            combined = f"{user_tokens}, {base_negative}, {studio_negatives}"
+            combined = f"{user_tokens}, {base_negative}, {studio_negatives}, {text_fidelity_negatives}"
         else:
-            combined = f"{base_negative}, {studio_negatives}"
+            combined = f"{base_negative}, {studio_negatives}, {text_fidelity_negatives}"
     else:
-        # Standard mode: just use base negative
+        # Standard mode: include text fidelity negatives
         if user_tokens:
-            combined = f"{user_tokens}, {base_negative}"
+            combined = f"{user_tokens}, {base_negative}, {text_fidelity_negatives}"
         else:
-            combined = base_negative
+            combined = f"{base_negative}, {text_fidelity_negatives}"
     
     return combined
 
@@ -746,6 +777,37 @@ def detect_extension_from_url(url: str) -> str:
         if lower.endswith(ext):
             return ext if ext != ".jpeg" else ".jpg"
     return ".png"
+
+def select_best_candidate(candidate_paths: List[Path]) -> Tuple[Path, float]:
+    """
+    Select the best candidate image based on sharpness score.
+    Returns (best_path, best_score).
+    """
+    if not candidate_paths:
+        raise ValueError("No candidate paths provided")
+    
+    best_path = None
+    best_score = -1.0
+    
+    for cand_path in candidate_paths:
+        if not cand_path.exists():
+            continue
+        try:
+            with Image.open(cand_path) as img:
+                score = estimate_sharpness(img)
+                if score > best_score:
+                    best_score = score
+                    best_path = cand_path
+        except Exception as e:
+            # Skip invalid images
+            continue
+    
+    if best_path is None:
+        # Fallback to first candidate if all failed
+        best_path = candidate_paths[0]
+        best_score = 0.0
+    
+    return (best_path, best_score)
 
 def normalize_product_framing(image_path: Path, target_width: int, target_height: int, padding_ratio: float = 0.10) -> None:
     """
@@ -919,6 +981,10 @@ class App:
         self.studio_mode_var = tk.BooleanVar(value=True)
         self.normalize_framing_var = tk.BooleanVar(value=False)
         self.enhance_refs_var = tk.BooleanVar(value=True)
+        self.text_fidelity_mode_var = tk.BooleanVar(value=True)
+        self.disable_autocrop_pack_var = tk.BooleanVar(value=True)
+        self.pack_candidates_var = tk.IntVar(value=2)
+        self.piece_candidates_var = tk.IntVar(value=1)
 
         self._build_ui()
         self._poll_log_queue()
@@ -1037,10 +1103,12 @@ class App:
         preset_cheap_btn = ttk.Button(row1, text="Preset: CHEAP", command=self.apply_preset_cheap)
         preset_cheap_btn.pack(side="left", padx=(0, 8))
         preset_hq_btn = ttk.Button(row1, text="Preset: HQ", command=self.apply_preset_hq)
-        preset_hq_btn.pack(side="left")
+        preset_hq_btn.pack(side="left", padx=(0, 8))
+        preset_text_fidelity_btn = ttk.Button(row1, text="Preset: TEXT_FIDELITY", command=self.apply_preset_text_fidelity)
+        preset_text_fidelity_btn.pack(side="left")
         
         # Add to lockable widgets
-        self.lockable_widgets.extend([width_entry, height_entry, gen_pack_cb, gen_piece_cb, alchemy_cb, skip_existing_cb, profile_combo, steps_entry, preset_cheap_btn, preset_hq_btn])
+        self.lockable_widgets.extend([width_entry, height_entry, gen_pack_cb, gen_piece_cb, alchemy_cb, skip_existing_cb, profile_combo, steps_entry, preset_cheap_btn, preset_hq_btn, preset_text_fidelity_btn])
 
         row2 = ttk.Frame(settings)
         row2.pack(fill="x", pady=(8, 0))
@@ -1050,6 +1118,12 @@ class App:
         ttk.Label(row2, text="Piece init_strength").pack(side="left")
         piece_strength_entry = ttk.Entry(row2, textvariable=self.piece_strength_var, width=8)
         piece_strength_entry.pack(side="left", padx=(6, 16))
+        ttk.Label(row2, text="Pack candidates").pack(side="left", padx=(16, 0))
+        pack_candidates_entry = ttk.Entry(row2, textvariable=self.pack_candidates_var, width=6)
+        pack_candidates_entry.pack(side="left", padx=(6, 16))
+        ttk.Label(row2, text="Piece candidates").pack(side="left")
+        piece_candidates_entry = ttk.Entry(row2, textvariable=self.piece_candidates_var, width=6)
+        piece_candidates_entry.pack(side="left", padx=(6, 0))
         
         row3 = ttk.Frame(settings)
         row3.pack(fill="x", pady=(8, 0))
@@ -1062,8 +1136,15 @@ class App:
         enhance_refs_cb = ttk.Checkbutton(row3, text="Enhance blurry refs (denoise+upscale+sharpen)", variable=self.enhance_refs_var)
         enhance_refs_cb.pack(side="left")
         
+        row4 = ttk.Frame(settings)
+        row4.pack(fill="x", pady=(8, 0))
+        text_fidelity_cb = ttk.Checkbutton(row4, text="Text Fidelity Mode (lock init_strength)", variable=self.text_fidelity_mode_var)
+        text_fidelity_cb.pack(side="left", padx=(0, 16))
+        disable_autocrop_pack_cb = ttk.Checkbutton(row4, text="Disable autocrop for PACK (preserve label margins)", variable=self.disable_autocrop_pack_var)
+        disable_autocrop_pack_cb.pack(side="left")
+        
         # Add to lockable widgets
-        self.lockable_widgets.extend([pack_strength_entry, piece_strength_entry, reject_watermarks_cb, studio_mode_cb, normalize_framing_cb, enhance_refs_cb])
+        self.lockable_widgets.extend([pack_strength_entry, piece_strength_entry, pack_candidates_entry, piece_candidates_entry, reject_watermarks_cb, studio_mode_cb, normalize_framing_cb, enhance_refs_cb, text_fidelity_cb, disable_autocrop_pack_cb])
 
         # Prompts
         prompts = ttk.LabelFrame(scrollable_frame, text="Prompts", padding=pad)
@@ -1302,6 +1383,19 @@ class App:
 
     def apply_preset_hq(self):
         self.apply_profile("HQ")
+    
+    def apply_preset_text_fidelity(self):
+        """Apply TEXT_FIDELITY preset for optimal packaging text fidelity."""
+        self.apply_profile("HQ")
+        self.pack_strength_var.set(0.97)
+        self.piece_strength_var.set(0.92)
+        self.pack_candidates_var.set(2)
+        self.piece_candidates_var.set(1)
+        self.studio_mode_var.set(True)
+        self.enhance_refs_var.set(True)
+        self.text_fidelity_mode_var.set(True)
+        self.disable_autocrop_pack_var.set(True)
+        self._log("Applied preset TEXT_FIDELITY: HQ profile, pack_strength=0.97, piece_strength=0.92, candidates=2/1, text fidelity mode ON")
 
     def _get_settings(self) -> Settings:
         return Settings(
@@ -1319,8 +1413,8 @@ class App:
             skip_existing=bool(self.skip_existing_var.get()),
             inference_steps=int(self.steps_var.get()),
             model_profile=self.profile_var.get(),
-            pack_num_images=1,
-            piece_num_images=1,
+            pack_num_images=int(self.pack_candidates_var.get()),
+            piece_num_images=int(self.piece_candidates_var.get()),
             pack_prompt=self.pack_prompt.get().strip(),
             piece_prompt=self.piece_prompt.get().strip(),
             negative_prompt=self.negative_prompt.get().strip(),
@@ -1328,6 +1422,8 @@ class App:
             studio_mode=bool(self.studio_mode_var.get()),
             normalize_framing=bool(self.normalize_framing_var.get()),
             enhance_refs=bool(self.enhance_refs_var.get()),
+            text_fidelity_mode=bool(self.text_fidelity_mode_var.get()),
+            disable_autocrop_pack=bool(self.disable_autocrop_pack_var.get()),
         )
 
     def on_test_api(self):
@@ -1543,17 +1639,24 @@ class App:
                             prep_dir = out_sku_dir / "_prep"
                             prep_pack = prep_dir / f"{sku}__pack_prep.png"
                             prep_path, sharpness_score = preprocess_ref_image(
-                                pack_ref, prep_pack, s.width, s.height, enhance=s.enhance_refs
+                                pack_ref, prep_pack, s.width, s.height, 
+                                enhance=s.enhance_refs,
+                                skip_autocrop=s.disable_autocrop_pack
                             )
-                            self._log(f"[{sku}] Preprocessed pack ref: sharpness={sharpness_score:.6f}")
+                            self._log(f"[{sku}] Preprocessed pack ref: sharpness={sharpness_score:.6f} (autocrop={'disabled' if s.disable_autocrop_pack else 'enabled'})")
                             
-                            # Auto-tune init_strength based on sharpness
+                            # Auto-tune init_strength based on sharpness (unless text fidelity mode is ON)
                             base_strength = s.pack_strength
-                            if sharpness_score < BLUR_THRESHOLD:
-                                effective_strength = max(0.70, min(base_strength, 0.78))
+                            if s.text_fidelity_mode:
+                                # Text Fidelity Mode: don't auto-lower, use user-provided strength
+                                effective_strength = clamp_init_strength(base_strength)
                             else:
-                                effective_strength = base_strength
-                            effective_strength = clamp_init_strength(effective_strength)
+                                # Original behavior: auto-lower if blurred
+                                if sharpness_score < BLUR_THRESHOLD:
+                                    effective_strength = max(0.70, min(base_strength, 0.78))
+                                else:
+                                    effective_strength = base_strength
+                                effective_strength = clamp_init_strength(effective_strength)
                             
                             self.set_status(f"{sku}: uploading pack ref…")
                             self._log(f"[{sku}] Using pack ref: {pack_ref.name} (preprocessed: {prep_path.name})")
@@ -1565,9 +1668,9 @@ class App:
                             current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
                             
                             # Debug payload log
-                            self._log(f"[PAYLOAD] {sku} PACK | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | sharpness={sharpness_score:.6f} base_strength={base_strength:.2f} effective_strength={effective_strength:.2f} | ref={pack_ref.name}")
+                            self._log(f"[PAYLOAD] {sku} PACK | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | sharpness={sharpness_score:.6f} base_strength={base_strength:.2f} effective_strength={effective_strength:.2f} | candidates={s.pack_num_images} | ref={pack_ref.name}")
 
-                            self.set_status(f"{sku}: generating PACK…")
+                            self.set_status(f"{sku}: generating PACK ({s.pack_num_images} candidate{'s' if s.pack_num_images > 1 else ''})…")
                             gen_id, cost = client.create_generation(
                                 prompt=pack_prompt_text,
                                 negative_prompt=s.negative_prompt,
@@ -1586,7 +1689,37 @@ class App:
                             self._log(f"[{sku}] PACK gen_id={gen_id} cost={cost}")
 
                             urls = client.wait_for_urls(gen_id, poll_s=s.poll_s, timeout_s=s.timeout_s)
-                            client.download(urls[0], out_pack)
+                            
+                            # Download all candidates to _candidates folder
+                            candidates_dir = out_sku_dir / "_candidates"
+                            candidates_dir.mkdir(exist_ok=True)
+                            candidate_paths = []
+                            
+                            for idx, url in enumerate(urls, start=1):
+                                cand_path = candidates_dir / f"{sku}__pack__cand{idx}.png"
+                                client.download(url, cand_path)
+                                candidate_paths.append(cand_path)
+                                self._log(f"[{sku}] Downloaded candidate {idx}/{len(urls)} -> {cand_path.name}")
+                            
+                            # Select best candidate based on sharpness
+                            if len(candidate_paths) > 1:
+                                best_cand, best_score = select_best_candidate(candidate_paths)
+                                self._log(f"[{sku}] Selected best candidate: {best_cand.name} (sharpness={best_score:.6f})")
+                                
+                                # Log all candidate scores
+                                for cand_path in candidate_paths:
+                                    try:
+                                        with Image.open(cand_path) as img:
+                                            score = estimate_sharpness(img)
+                                            self._log(f"[{sku}] Candidate {cand_path.name}: sharpness={score:.6f}")
+                                    except:
+                                        pass
+                                
+                                # Copy best candidate to final output
+                                shutil.copy2(best_cand, out_pack)
+                            else:
+                                # Single candidate: just copy it
+                                shutil.copy2(candidate_paths[0], out_pack)
                             
                             # Optional postprocess for framing
                             if s.normalize_framing:
@@ -1607,6 +1740,7 @@ class App:
                                 "modelId": MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP,
                                 "prompt": pack_prompt_text,
                                 "negative_prompt": s.negative_prompt,
+                                "num_candidates": s.pack_num_images,
                             }
                             settings_path = out_sku_dir / "pack_settings.json"
                             with settings_path.open("w", encoding="utf-8") as f:
@@ -1649,21 +1783,28 @@ class App:
                             self._log(f"[WARNING] {sku} piece ref may contain text/watermark overlay, but continuing (reject_watermarks is OFF).")
                         
                         try:
-                            # Preprocess reference image
+                            # Preprocess reference image (piece always uses autocrop)
                             prep_dir = out_sku_dir / "_prep"
                             prep_piece = prep_dir / f"{sku}__piece_prep.png"
                             prep_path, sharpness_score = preprocess_ref_image(
-                                piece_ref, prep_piece, s.width, s.height, enhance=s.enhance_refs
+                                piece_ref, prep_piece, s.width, s.height, 
+                                enhance=s.enhance_refs,
+                                skip_autocrop=False  # Piece always uses autocrop
                             )
                             self._log(f"[{sku}] Preprocessed piece ref: sharpness={sharpness_score:.6f}")
                             
-                            # Auto-tune init_strength based on sharpness
+                            # Auto-tune init_strength based on sharpness (unless text fidelity mode is ON)
                             base_strength = s.piece_strength
-                            if sharpness_score < BLUR_THRESHOLD:
-                                effective_strength = max(0.70, min(base_strength, 0.78))
+                            if s.text_fidelity_mode:
+                                # Text Fidelity Mode: don't auto-lower, use user-provided strength
+                                effective_strength = clamp_init_strength(base_strength)
                             else:
-                                effective_strength = base_strength
-                            effective_strength = clamp_init_strength(effective_strength)
+                                # Original behavior: auto-lower if blurred
+                                if sharpness_score < BLUR_THRESHOLD:
+                                    effective_strength = max(0.70, min(base_strength, 0.78))
+                                else:
+                                    effective_strength = base_strength
+                                effective_strength = clamp_init_strength(effective_strength)
                             
                             self.set_status(f"{sku}: uploading piece ref…")
                             self._log(f"[{sku}] Using piece ref: {piece_ref.name} (preprocessed: {prep_path.name})")
@@ -1675,9 +1816,9 @@ class App:
                             current_model = MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP
                             
                             # Debug payload log
-                            self._log(f"[PAYLOAD] {sku} PIECE | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | sharpness={sharpness_score:.6f} base_strength={base_strength:.2f} effective_strength={effective_strength:.2f} | ref={piece_ref.name}")
+                            self._log(f"[PAYLOAD] {sku} PIECE | {s.width}x{s.height} | steps={s.inference_steps} | alchemy={s.alchemy} | modelId={current_model} | sharpness={sharpness_score:.6f} base_strength={base_strength:.2f} effective_strength={effective_strength:.2f} | candidates={s.piece_num_images} | ref={piece_ref.name}")
 
-                            self.set_status(f"{sku}: generating PIECE…")
+                            self.set_status(f"{sku}: generating PIECE ({s.piece_num_images} candidate{'s' if s.piece_num_images > 1 else ''})…")
                             gen_id2, cost2 = client.create_generation(
                                 prompt=piece_prompt_text,
                                 negative_prompt=s.negative_prompt,
@@ -1696,7 +1837,37 @@ class App:
                             self._log(f"[{sku}] PIECE gen_id={gen_id2} cost={cost2}")
 
                             urls2 = client.wait_for_urls(gen_id2, poll_s=s.poll_s, timeout_s=s.timeout_s)
-                            client.download(urls2[0], out_piece)
+                            
+                            # Download all candidates to _candidates folder
+                            candidates_dir = out_sku_dir / "_candidates"
+                            candidates_dir.mkdir(exist_ok=True)
+                            candidate_paths = []
+                            
+                            for idx, url in enumerate(urls2, start=1):
+                                cand_path = candidates_dir / f"{sku}__piece__cand{idx}.png"
+                                client.download(url, cand_path)
+                                candidate_paths.append(cand_path)
+                                self._log(f"[{sku}] Downloaded candidate {idx}/{len(urls2)} -> {cand_path.name}")
+                            
+                            # Select best candidate based on sharpness
+                            if len(candidate_paths) > 1:
+                                best_cand, best_score = select_best_candidate(candidate_paths)
+                                self._log(f"[{sku}] Selected best candidate: {best_cand.name} (sharpness={best_score:.6f})")
+                                
+                                # Log all candidate scores
+                                for cand_path in candidate_paths:
+                                    try:
+                                        with Image.open(cand_path) as img:
+                                            score = estimate_sharpness(img)
+                                            self._log(f"[{sku}] Candidate {cand_path.name}: sharpness={score:.6f}")
+                                    except:
+                                        pass
+                                
+                                # Copy best candidate to final output
+                                shutil.copy2(best_cand, out_piece)
+                            else:
+                                # Single candidate: just copy it
+                                shutil.copy2(candidate_paths[0], out_piece)
                             
                             # Optional postprocess for framing
                             if s.normalize_framing:
@@ -1717,6 +1888,7 @@ class App:
                                 "modelId": MODEL_HQ if s.model_profile == "HQ" else MODEL_CHEAP,
                                 "prompt": piece_prompt_text,
                                 "negative_prompt": s.negative_prompt,
+                                "num_candidates": s.piece_num_images,
                             }
                             settings_path = out_sku_dir / "piece_settings.json"
                             with settings_path.open("w", encoding="utf-8") as f:

@@ -106,6 +106,36 @@ When installed via installer, workspace is at `<install_dir>/workspace/` (typica
 
 - **CHEAP**: 768×768, 30 steps, Alchemy ON, init_strength 0.90
 - **HQ**: 1024×1024, 30 steps, Alchemy ON, init_strength 0.90
+- **TEXT_FIDELITY**: Optimized for packaging text fidelity (HQ profile, pack_strength 0.97, piece_strength 0.92, 2 pack candidates, text fidelity mode ON)
+
+## Best Settings for Packaging Text Fidelity
+
+For optimal text fidelity in product pack shots, use the **TEXT_FIDELITY preset**:
+
+1. **Click "Preset: TEXT_FIDELITY"** - This automatically configures:
+   - Profile: HQ (1024×1024)
+   - Pack init_strength: 0.97 (high fidelity to reference)
+   - Piece init_strength: 0.92
+   - Pack candidates: 2 (generates 2 variants, picks best)
+   - Piece candidates: 1
+   - Studio Photo Mode: ON
+   - Enhance refs: ON
+   - Text Fidelity Mode: ON (prevents auto-lowering init_strength)
+   - Disable autocrop for PACK: ON (preserves label margins)
+
+2. **Use high-quality reference images** - Sharp, well-lit reference images with clear text produce better results.
+
+3. **Candidate Generation** - When Pack candidates > 1:
+   - All candidates are saved to `output/<SKU>__<name>/_candidates/`
+   - The best candidate (highest sharpness score) is automatically selected as the final output
+   - Candidate scores are logged for review
+   - Example filenames: `<SKU>__pack__cand1.png`, `<SKU>__pack__cand2.png`
+
+**Key Features for Text Fidelity:**
+- **Text Fidelity Mode**: Locks init_strength to user-provided value (doesn't auto-lower on blur detection)
+- **Disable autocrop for PACK**: Preserves label margins that might be cropped as "white space"
+- **Enhanced negative prompts**: Includes tokens against text warping/distortion
+- **Studio Photo Mode**: Preserves original packaging text (for pack variant) instead of forbidding it
 
 ## Troubleshooting
 
